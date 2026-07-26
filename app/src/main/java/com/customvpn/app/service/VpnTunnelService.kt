@@ -315,7 +315,7 @@ class VpnTunnelService : VpnService() {
 
             val udpHeader = ByteBuffer.wrap(packet, udpHeaderOffset, 8)
             val srcPort = udpHeader.short.toInt() and 0xFFFF
-            val dstPort = udpHeader.short.getInt() and 0xFFFF
+            val dstPort = udpHeader.short.toInt() and 0xFFFF
 
             if (dstPort == 53) {
                 val cfg = currentConfig
