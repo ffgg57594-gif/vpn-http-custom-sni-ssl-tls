@@ -13,7 +13,8 @@ import javax.net.ssl.*
 
 class SslTunnel(
     private val config: VpnConfig,
-    private val listener: TunnelListener? = null
+    private val listener: TunnelListener? = null,
+    private val socketProtector: ((Socket) -> Unit)? = null
 ) {
 
     interface TunnelListener {
@@ -210,6 +211,8 @@ class SslTunnel(
 
             val factory = sslContext.socketFactory as SSLSocketFactory
             val sock = factory.createSocket() as SSLSocket
+
+            socketProtector?.invoke(sock)
 
             val sniHost = config.sni.ifEmpty { config.serverAddress }
 

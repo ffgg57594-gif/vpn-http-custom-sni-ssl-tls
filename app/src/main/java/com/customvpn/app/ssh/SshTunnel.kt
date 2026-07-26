@@ -9,7 +9,8 @@ import java.nio.ByteBuffer
 
 class SshTunnel(
     private val config: VpnConfig,
-    private val listener: TunnelListener? = null
+    private val listener: TunnelListener? = null,
+    private val socketProtector: ((Socket) -> Unit)? = null
 ) {
 
     interface TunnelListener {
@@ -203,6 +204,7 @@ class SshTunnel(
     private fun createSshConnection(targetHost: String, targetPort: Int): Socket? {
         return try {
             val sock = Socket()
+            socketProtector?.invoke(sock)
             sock.connect(InetSocketAddress(config.serverAddress, config.sshPort), 10000)
             sock.soTimeout = 60000
 
