@@ -1,0 +1,6 @@
+-keepattributes Signature
+-keepattributes *Annotation*
+-keep class com.customvpn.app.** { *; }
+-dontwarn javax.annotation.**
+-dontwarn org.conscrypt.**
+-keep class org.conscrypt.** { *; }
