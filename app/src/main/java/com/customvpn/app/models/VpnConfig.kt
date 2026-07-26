@@ -110,7 +110,7 @@ data class VpnConfig(
             var password = ""
 
             // Extract credentials after @
-            val atIdx = trimmed.lastIndexOf('\'@')
+            val atIdx = trimmed.lastIndexOf('@')
             if (atIdx > 0) {
                 addressPart = trimmed.substring(0, atIdx)
                 val credentials = trimmed.substring(atIdx + 1)
