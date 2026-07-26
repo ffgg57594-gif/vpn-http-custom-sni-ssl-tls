@@ -71,10 +71,10 @@ class VpnTunnelService : VpnService() {
         when (intent?.action) {
             ACTION_CONNECT, ACTION_START -> {
                 val config = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                    intent.getSerializableExtra("config", VpnConfig::class.java)
+                    intent.getParcelableExtra("config", VpnConfig::class.java)
                 } else {
                     @Suppress("DEPRECATION")
-                    intent.getSerializableExtra("config") as? VpnConfig
+                    intent.getParcelableExtra("config") as? VpnConfig
                 }
                 if (config != null) {
                     connect(config)

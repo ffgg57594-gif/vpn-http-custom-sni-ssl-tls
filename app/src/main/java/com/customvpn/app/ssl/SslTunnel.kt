@@ -1,9 +1,11 @@
 package com.customvpn.app.ssl
 
 import com.customvpn.app.models.VpnConfig
+import com.customvpn.app.utils.PayloadBuilder
 import java.io.*
 import java.net.InetSocketAddress
 import java.net.Socket
+import java.nio.ByteBuffer
 import java.security.SecureRandom
 import java.security.cert.X509Certificate
 import javax.net.ssl.*
@@ -73,67 +75,88 @@ class SslTunnel(
         try {
             clientSocket.soTimeout = 30000
 
-            val buf = ByteArray(32768)
+            val buf = ByteArray(1024)
             val input = clientSocket.getInputStream()
-            val read = input.read(buf)
-            if (read <= 0) {
+            val readLen = input.read(buf)
+            if (readLen <= 0) {
                 clientSocket.close()
                 return
             }
 
-            val headerStr = String(buf, 0, read, Charsets.US_ASCII)
-            val firstLine = headerStr.lines().firstOrNull() ?: ""
-            val parts = firstLine.split(" ")
+            val headerStr = String(buf, 0, readLen, Charsets.US_ASCII)
 
-            val targetHost: String
-            val targetPort: Int
-            val isConnect: Boolean
-            var remainingData: ByteArray? = null
+            if (headerStr.startsWith("GET ") || headerStr.startsWith("POST ") || headerStr.startsWith("CONNECT ")) {
+                handleHttpProxy(clientSocket, buf, readLen, headerStr)
+                return
+            }
 
-            if (parts[0] == "CONNECT") {
-                val hostPort = parts[1].split(":")
-                targetHost = hostPort[0]
-                targetPort = hostPort.getOrNull(1)?.toIntOrNull() ?: 443
-                isConnect = true
+            // SOCKS5 protocol
+            if (buf[0] == 0x05.toByte()) {
+                // Greeting: version + nmethods + methods
+                clientSocket.getOutputStream().write(byteArrayOf(0x05, 0x00))
+                clientSocket.getOutputStream().flush()
 
-                val headerEnd = headerStr.indexOf("\r\n\r\n")
-                if (headerEnd > 0 && headerEnd + 4 < read) {
-                    remainingData = buf.copyOfRange(headerEnd + 4, read)
+                // Read CONNECT request
+                val connectBuf = ByteArray(256)
+                val connectLen = input.read(connectBuf)
+                if (connectLen < 7) {
+                    clientSocket.close()
+                    return
                 }
-            } else if (parts.size >= 3) {
-                val url = try { java.net.URL(parts[1]) } catch (_: Exception) { return }
-                targetHost = url.host
-                targetPort = if (url.port > 0) url.port else 443
-                isConnect = false
-                remainingData = buf.copyOfRange(0, read)
-            } else {
-                clientSocket.close()
-                return
-            }
 
-            listener?.onLog("Connecting to $targetHost:$targetPort via SSL/TLS")
-
-            sslSocket = createSslConnection(targetHost, targetPort)
-
-            if (sslSocket != null) {
-                listener?.onConnected()
-                if (isConnect) {
-                    clientSocket.getOutputStream().write("HTTP/1.1 200 Connection Established\r\n\r\n".toByteArray())
+                val cmd = connectBuf[1].toInt() and 0xFF
+                if (cmd != 0x01) {
+                    clientSocket.getOutputStream().write(byteArrayOf(0x05, 0x07, 0x00, 0x01, 0, 0, 0, 0, 0, 0))
                     clientSocket.getOutputStream().flush()
+                    clientSocket.close()
+                    return
                 }
 
-                if (remainingData != null && remainingData.isNotEmpty()) {
-                    sslSocket.outputStream.write(remainingData)
-                    sslSocket.outputStream.flush()
+                val atyp = connectBuf[3].toInt() and 0xFF
+                val targetHost: String
+                val targetPort: Int
+
+                when (atyp) {
+                    0x01 -> {
+                        if (connectLen < 10) { clientSocket.close(); return }
+                        targetHost = "${connectBuf[4].toInt() and 0xFF}.${connectBuf[5].toInt() and 0xFF}.${connectBuf[6].toInt() and 0xFF}.${connectBuf[7].toInt() and 0xFF}"
+                        targetPort = ((connectBuf[8].toInt() and 0xFF) shl 8) or (connectBuf[9].toInt() and 0xFF)
+                    }
+                    0x03 -> {
+                        val domainLen = connectBuf[4].toInt() and 0xFF
+                        if (connectLen < 5 + domainLen + 2) { clientSocket.close(); return }
+                        targetHost = String(connectBuf, 5, domainLen)
+                        targetPort = ((connectBuf[5 + domainLen].toInt() and 0xFF) shl 8) or (connectBuf[6 + domainLen].toInt() and 0xFF)
+                    }
+                    0x04 -> {
+                        if (connectLen < 22) { clientSocket.close(); return }
+                        val ipv6 = ByteArray(16)
+                        System.arraycopy(connectBuf, 4, ipv6, 0, 16)
+                        targetHost = InetAddress.getByAddress(ipv6).hostAddress ?: ""
+                        targetPort = ((connectBuf[20].toInt() and 0xFF) shl 8) or (connectBuf[21].toInt() and 0xFF)
+                    }
+                    else -> {
+                        clientSocket.getOutputStream().write(byteArrayOf(0x05, 0x08, 0x00, 0x01, 0, 0, 0, 0, 0, 0))
+                        clientSocket.getOutputStream().flush()
+                        clientSocket.close()
+                        return
+                    }
                 }
 
-                pipe(clientSocket, sslSocket)
-            } else {
-                if (isConnect) {
-                    clientSocket.getOutputStream().write("HTTP/1.1 502 Bad Gateway\r\n\r\n".toByteArray())
+                val remoteSocket = createSslSocksConnection(targetHost, targetPort)
+                if (remoteSocket != null) {
+                    clientSocket.getOutputStream().write(byteArrayOf(0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0))
+                    clientSocket.getOutputStream().flush()
+                    pipe(clientSocket, remoteSocket)
+                } else {
+                    clientSocket.getOutputStream().write(byteArrayOf(0x05, 0x05, 0x00, 0x01, 0, 0, 0, 0, 0, 0))
+                    clientSocket.getOutputStream().flush()
+                    clientSocket.close()
                 }
-                clientSocket.close()
+                return
             }
+
+            clientSocket.close()
         } catch (e: Exception) {
             listener?.onLog("SSL client error: ${e.message}")
             try { clientSocket.close() } catch (_: Exception) {}
@@ -141,7 +164,45 @@ class SslTunnel(
         }
     }
 
-    private fun createSslConnection(targetHost: String, targetPort: Int): SSLSocket? {
+    private fun handleHttpProxy(clientSocket: Socket, header: ByteArray, headerLen: Int, headerStr: String) {
+        try {
+            val input = clientSocket.getInputStream()
+            val firstLine = headerStr.lines().firstOrNull() ?: ""
+            val parts = firstLine.split(" ")
+
+            val targetHost: String
+            val targetPort: Int
+
+            if (parts[0] == "CONNECT") {
+                val hostPort = parts[1].split(":")
+                targetHost = hostPort[0]
+                targetPort = hostPort.getOrNull(1)?.toIntOrNull() ?: 443
+            } else {
+                val url = java.net.URL(parts[1])
+                targetHost = url.host
+                targetPort = if (url.port > 0) url.port else if (url.protocol == "https") 443 else 80
+            }
+
+            val remoteSocket = createSslSocksConnection(targetHost, targetPort)
+            if (remoteSocket != null) {
+                if (parts[0] == "CONNECT") {
+                    clientSocket.getOutputStream().write("HTTP/1.1 200 Connection Established\r\n\r\n".toByteArray())
+                    clientSocket.getOutputStream().flush()
+                } else {
+                    remoteSocket.getOutputStream().write(header, 0, headerLen)
+                    remoteSocket.getOutputStream().flush()
+                }
+                pipe(clientSocket, remoteSocket, null, 0, 0)
+            } else {
+                clientSocket.getOutputStream().write("HTTP/1.1 502 Bad Gateway\r\n\r\n".toByteArray())
+                clientSocket.close()
+            }
+        } catch (e: Exception) {
+            try { clientSocket.close() } catch (_: Exception) {}
+        }
+    }
+
+    private fun createSslSocksConnection(targetHost: String, targetPort: Int): Socket? {
         return try {
             val sslContext = SSLContext.getInstance("TLS")
             sslContext.init(null, arrayOf<TrustManager>(trustAllManager), SecureRandom())
@@ -149,7 +210,7 @@ class SslTunnel(
             val factory = sslContext.socketFactory as SSLSocketFactory
             val sock = factory.createSocket() as SSLSocket
 
-            val sniHost = config.sni.ifEmpty { targetHost }
+            val sniHost = config.sni.ifEmpty { config.serverAddress }
 
             val params = sock.sslParameters
             try {
@@ -163,11 +224,31 @@ class SslTunnel(
                 } catch (_: Exception) {}
             }
 
-            sock.connect(InetSocketAddress(config.serverAddress, config.serverPort), 15000)
+            val serverPort = if (config.serverPort > 0) config.serverPort else 443
+            sock.connect(InetSocketAddress(config.serverAddress, serverPort), 15000)
             sock.soTimeout = 60000
 
             sock.startHandshake()
             listener?.onLog("SSL/TLS handshake completed with SNI: $sniHost")
+
+            if (config.payload.isNotEmpty()) {
+                val payload = PayloadBuilder.preparePayloadForSsh(config.payload)
+                sock.getOutputStream().write(payload.toByteArray())
+                sock.getOutputStream().flush()
+                Thread.sleep(200)
+                listener?.onLog("Payload sent through SSL tunnel")
+            }
+
+            val connectPacket = buildSocksConnect(targetHost, targetPort)
+            sock.getOutputStream().write(connectPacket)
+            sock.getOutputStream().flush()
+
+            val response = ByteArray(10)
+            val readLen = sock.getInputStream().read(response)
+            if (readLen > 0) {
+                val respStr = String(response, 0, readLen)
+                listener?.onLog("SSL connect response: ${respStr.take(100)}")
+            }
 
             sock
         } catch (e: Exception) {
@@ -176,37 +257,56 @@ class SslTunnel(
         }
     }
 
-    private fun pipe(local: Socket, remote: SSLSocket) {
+    private fun buildSocksConnect(host: String, port: Int): ByteArray {
+        val buf = ByteBuffer.allocate(512)
+        buf.put(0x05)
+        buf.put(0x01)
+        buf.put(0x00)
+        buf.put(0x03)
+        val hostBytes = host.toByteArray()
+        buf.put(hostBytes.size.toByte())
+        buf.put(hostBytes)
+        buf.putShort(port.toShort())
+        val result = ByteArray(buf.position())
+        buf.flip()
+        buf.get(result)
+        return result
+    }
+
+    private fun pipe(client: Socket, remote: Socket, initialData: ByteArray?, initialOffset: Int, initialLen: Int) {
         try {
-            val toRemote = Thread {
+            if (initialData != null && initialLen > 0) {
+                remote.getOutputStream().write(initialData, initialOffset, initialLen)
+                remote.getOutputStream().flush()
+            }
+
+            Thread {
                 try {
                     val buf = ByteArray(32768)
-                    val input = local.getInputStream()
+                    val clientInput = client.getInputStream()
                     while (isRunning) {
-                        val n = input.read(buf)
-                        if (n == -1) break
-                        remote.outputStream.write(buf, 0, n)
-                        remote.outputStream.flush()
+                        val read = clientInput.read(buf)
+                        if (read == -1) break
+                        remote.getOutputStream().write(buf, 0, read)
+                        remote.getOutputStream().flush()
                     }
                 } catch (_: Exception) {}
                 finally {
                     try { remote.close() } catch (_: Exception) {}
                 }
-            }
-            toRemote.isDaemon = true
-            toRemote.start()
+            }.start()
 
             val buf = ByteArray(32768)
-            val input = remote.inputStream
+            val remoteInput = remote.getInputStream()
             while (isRunning) {
-                val n = input.read(buf)
-                if (n == -1) break
-                local.outputStream.write(buf, 0, n)
-                local.outputStream.flush()
+                val read = remoteInput.read(buf)
+                if (read == -1) break
+                client.getOutputStream().write(buf, 0, read)
+                client.getOutputStream().flush()
             }
         } catch (_: Exception) {}
         finally {
-            try { local.close() } catch (_: Exception) {}
+            try { client.close() } catch (_: Exception) {}
             try { remote.close() } catch (_: Exception) {}
         }
     }
