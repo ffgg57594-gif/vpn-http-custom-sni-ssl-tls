@@ -1,6 +1,5 @@
 package com.customvpn.app.ssl
 
-import android.util.Log
 import com.customvpn.app.models.VpnConfig
 import java.io.*
 import java.net.InetSocketAddress

@@ -1,6 +1,7 @@
 package com.customvpn.app.models
 
 import java.io.Serializable
+import java.util.ArrayList
 
 data class VpnConfig(
     val name: String = "",
@@ -18,7 +19,7 @@ data class VpnConfig(
     val mtu: Int = 1500,
     val compress: Boolean = false,
     val enableUDPDns: Boolean = true,
-    val bypassApps: List<String> = emptyList()
+    val bypassApps: ArrayList<String> = ArrayList()
 ) : Serializable {
 
     enum class ConnectionMode(val displayName: String) {
