@@ -4,6 +4,7 @@
     <string name="disconnect">Disconnect</string>
     <string name="server_address">Server Address</string>
     <string name="server_port">Server Port</string>
+    <string name="server_config_hint">Server: ip:port@username:password</string>
     <string name="sni_label">SNI (Server Name)</string>
     <string name="payload_label">Custom Payload</string>
     <string name="connection_mode">Connection Mode</string>

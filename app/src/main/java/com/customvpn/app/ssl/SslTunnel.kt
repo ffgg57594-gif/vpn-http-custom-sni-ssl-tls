@@ -4,7 +4,6 @@ import com.customvpn.app.models.VpnConfig
 import java.io.*
 import java.net.InetSocketAddress
 import java.net.Socket
-import java.nio.ByteBuffer
 import java.security.SecureRandom
 import java.security.cert.X509Certificate
 import javax.net.ssl.*
@@ -145,17 +144,35 @@ class SslTunnel(
             val factory = sslContext.socketFactory as SSLSocketFactory
             val sock = factory.createSocket() as SSLSocket
 
+            val sniHost = config.sni.ifEmpty { targetHost }
+
+            // Set SNI via SSLParameters
+            val params = sock.sslParameters
+            params.setEndpointIdentificationAlgorithm("HTTPS")
+            val sniHostNames = listOf(sniHost)
+            params.setServerNames(listOf(SNIHostName(sniHost)))
+
             sock.connect(InetSocketAddress(config.serverAddress, config.serverPort), 15000)
             sock.soTimeout = 60000
 
+            // Apply SNI params before handshake
             try {
-                val hostnameField = sock.javaClass.getDeclaredField("host")
-                hostnameField.isAccessible = true
-                hostnameField.set(sock, targetHost)
-            } catch (_: Exception) {}
+                val paramsField = sock.javaClass.getDeclaredField("sslParameters")
+                paramsField.isAccessible = true
+                val sslParams = paramsField.get(sock)
+                val sniField = sslParams.javaClass.getDeclaredMethod("setServerNames", java.util.List::class.java)
+                sniField.invoke(sslParams, sniHostNames)
+            } catch (_: Exception) {
+                // Fallback: set hostname via reflection
+                try {
+                    val hostnameField = sock.javaClass.getDeclaredField("host")
+                    hostnameField.isAccessible = true
+                    hostnameField.set(sock, sniHost)
+                } catch (_: Exception) {}
+            }
 
             sock.startHandshake()
-            listener?.onLog("SSL/TLS handshake completed with $targetHost")
+            listener?.onLog("SSL/TLS handshake completed with SNI: $sniHost")
 
             sock
         } catch (e: Exception) {

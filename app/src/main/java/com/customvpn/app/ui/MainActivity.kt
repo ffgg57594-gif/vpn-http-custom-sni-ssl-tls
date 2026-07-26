@@ -38,12 +38,8 @@ class MainActivity : AppCompatActivity() {
     private lateinit var statusText: TextView
     private lateinit var statusIcon: ImageView
     private lateinit var connectionInfo: TextView
-    private lateinit var etServerAddress: TextInputEditText
-    private lateinit var etServerPort: TextInputEditText
-    private lateinit var etSshPort: TextInputEditText
+    private lateinit var etServerConfig: TextInputEditText
     private lateinit var etSni: TextInputEditText
-    private lateinit var etUsername: TextInputEditText
-    private lateinit var etPassword: TextInputEditText
     private lateinit var etPayload: TextInputEditText
     private lateinit var spinnerMode: AutoCompleteTextView
     private lateinit var rvLogs: RecyclerView
@@ -83,12 +79,8 @@ class MainActivity : AppCompatActivity() {
         statusText = findViewById(R.id.statusText)
         statusIcon = findViewById(R.id.statusIcon)
         connectionInfo = findViewById(R.id.connectionInfo)
-        etServerAddress = findViewById(R.id.etServerAddress)
-        etServerPort = findViewById(R.id.etServerPort)
-        etSshPort = findViewById(R.id.etSshPort)
+        etServerConfig = findViewById(R.id.etServerConfig)
         etSni = findViewById(R.id.etSni)
-        etUsername = findViewById(R.id.etUsername)
-        etPassword = findViewById(R.id.etPassword)
         etPayload = findViewById(R.id.etPayload)
         spinnerMode = findViewById(R.id.spinnerMode)
         rvLogs = findViewById(R.id.rvLogs)
@@ -170,24 +162,16 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun populateInputs(config: VpnConfig) {
-        etServerAddress.setText(config.serverAddress)
-        etServerPort.setText(config.serverPort.toString())
-        etSshPort.setText(config.sshPort.toString())
+        etServerConfig.setText(config.toServerString())
         etSni.setText(config.sni)
-        etUsername.setText(config.username)
-        etPassword.setText(config.password)
         etPayload.setText(config.payload)
         spinnerMode.setText(config.connectionMode.displayName, false)
     }
 
     private fun buildConfigFromInputs(): VpnConfig {
-        return VpnConfig(
-            serverAddress = etServerAddress.text.toString().trim(),
-            serverPort = etServerPort.text.toString().trim().toIntOrNull() ?: 443,
-            sshPort = etSshPort.text.toString().trim().toIntOrNull() ?: 22,
+        val parsed = VpnConfig.parseServerConfig(etServerConfig.text.toString())
+        return parsed.copy(
             sni = etSni.text.toString().trim(),
-            username = etUsername.text.toString().trim(),
-            password = etPassword.text.toString().trim(),
             payload = etPayload.text.toString().trim(),
             connectionMode = VpnConfig.ConnectionMode.values().firstOrNull {
                 it.displayName == spinnerMode.text.toString()
@@ -199,7 +183,7 @@ class MainActivity : AppCompatActivity() {
         val config = buildConfigFromInputs()
 
         if (config.serverAddress.isEmpty()) {
-            etServerAddress.error = "Server address is required"
+            etServerConfig.error = "Server address is required (ip:port@user:pass)"
             return
         }
 
@@ -296,7 +280,7 @@ class MainActivity : AppCompatActivity() {
     private fun showAboutDialog() {
         AlertDialog.Builder(this)
             .setTitle("Custom VPN")
-            .setMessage("Custom VPN - SSH/SSL/SNI Tunnel\n\nVersion 1.0.0\n\nSimilar to HTTP Custom VPN.\n\nFeatures:\n• SSH Tunnel\n• SSL/TLS Tunnel\n• Custom SNI\n• HTTP Payload\n• SOCKS5 Proxy")
+            .setMessage("Custom VPN - SSH/SSL/SNI Tunnel\n\nVersion 1.0.0\n\nSimilar to HTTP Custom VPN.\n\nFeatures:\n\u2022 SSH Tunnel\n\u2022 SSL/TLS Tunnel\n\u2022 Custom SNI\n\u2022 HTTP Payload\n\u2022 SOCKS5 Proxy\n\nServer format: ip:port@username:password")
             .setPositiveButton("OK", null)
             .show()
     }
