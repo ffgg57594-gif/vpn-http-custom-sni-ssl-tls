@@ -106,7 +106,8 @@ class VpnTunnelService : VpnService() {
                 connectionState = ConnectionState.FAILED
                 disconnect()
             }
-        }.start()
+        }
+        tunnelThread?.start()
     }
 
     private fun connectSslSsh(config: VpnConfig) {
