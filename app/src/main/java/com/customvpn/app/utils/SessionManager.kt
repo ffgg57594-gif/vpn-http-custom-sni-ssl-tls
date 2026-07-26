@@ -29,6 +29,38 @@ class SessionManager(context: Context) {
             prefs.edit().putString("last_config", gson.toJson(value)).apply()
         }
 
+    fun saveLastServer(server: String) {
+        prefs.edit().putString("last_server", server).apply()
+    }
+
+    fun getLastServer(): String {
+        return prefs.getString("last_server", "") ?: ""
+    }
+
+    fun saveLastSni(sni: String) {
+        prefs.edit().putString("last_sni", sni).apply()
+    }
+
+    fun getLastSni(): String {
+        return prefs.getString("last_sni", "") ?: ""
+    }
+
+    fun saveLastMode(mode: String) {
+        prefs.edit().putString("last_mode", mode).apply()
+    }
+
+    fun getLastMode(): String {
+        return prefs.getString("last_mode", "") ?: ""
+    }
+
+    fun saveLastPayload(payload: String) {
+        prefs.edit().putString("last_payload", payload).apply()
+    }
+
+    fun getLastPayload(): String {
+        return prefs.getString("last_payload", "") ?: ""
+    }
+
     fun saveConfigs(configs: List<VpnConfig>) {
         prefs.edit().putString("saved_configs", gson.toJson(configs)).apply()
     }

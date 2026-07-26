@@ -142,92 +142,127 @@ class MainActivity : AppCompatActivity() {
         }
 
         btnGeneratePayload.setOnClickListener {
-            val config = buildConfigFromInputs()
-            val payload = PayloadBuilder.buildCustomPayload(
-                config.serverAddress,
-                config.sni.ifEmpty { config.serverAddress }
-            )
+            val sni = etSni.text?.toString()?.trim() ?: ""
+            val server = etServerConfig.text?.toString()?.trim() ?: ""
+            val config = VpnConfig.parseServerConfig(server)
+            val host = sni.ifEmpty { config.serverAddress }
+            val payload = PayloadBuilder.buildCustomPayload(config.serverAddress, host)
             etPayload.setText(payload)
             Toast.makeText(this, "Payload generated", Toast.LENGTH_SHORT).show()
         }
 
         btnClearLogs.setOnClickListener {
-            logAdapter.clear()
+            logAdapter.setLogs(emptyList())
         }
     }
 
     private fun loadLastConfig() {
-        val config = sessionManager.lastConfig ?: return
-        populateInputs(config)
-    }
+        val lastServer = sessionManager.getLastServer()
+        val lastSni = sessionManager.getLastSni()
+        val lastMode = sessionManager.getLastMode()
+        val lastPayload = sessionManager.getLastPayload()
 
-    private fun populateInputs(config: VpnConfig) {
-        etServerConfig.setText(config.toServerString())
-        etSni.setText(config.sni)
-        etPayload.setText(config.payload)
-        spinnerMode.setText(config.connectionMode.displayName, false)
-    }
-
-    private fun buildConfigFromInputs(): VpnConfig {
-        val parsed = VpnConfig.parseServerConfig(etServerConfig.text.toString())
-        return parsed.copy(
-            sni = etSni.text.toString().trim(),
-            payload = etPayload.text.toString().trim(),
-            connectionMode = VpnConfig.ConnectionMode.values().firstOrNull {
-                it.displayName == spinnerMode.text.toString()
-            } ?: VpnConfig.ConnectionMode.SSL_TLS_SNI
-        )
+        if (lastServer.isNotEmpty()) {
+            etServerConfig.setText(lastServer)
+        }
+        if (lastSni.isNotEmpty()) {
+            etSni.setText(lastSni)
+        }
+        if (lastMode.isNotEmpty()) {
+            spinnerMode.setText(lastMode, false)
+        }
+        if (lastPayload.isNotEmpty()) {
+            etPayload.setText(lastPayload)
+        }
     }
 
     private fun prepareAndStartVpn() {
-        val config = buildConfigFromInputs()
-
-        if (config.serverAddress.isEmpty()) {
-            etServerConfig.error = "Server address is required (ip:port@user:pass)"
+        val serverConfig = etServerConfig.text?.toString()?.trim() ?: ""
+        if (serverConfig.isEmpty()) {
+            etServerConfig.error = "Enter server config"
+            Toast.makeText(this, "Please enter server configuration", Toast.LENGTH_SHORT).show()
             return
         }
 
-        pendingConfig = config
-        sessionManager.lastConfig = config
+        val config = buildConfigFromInputs()
+        if (config.serverAddress.isEmpty()) {
+            Toast.makeText(this, "Invalid server address", Toast.LENGTH_SHORT).show()
+            return
+        }
 
-        val vpnIntent = VpnService.prepare(this)
-        if (vpnIntent != null) {
-            vpnPermissionLauncher.launch(vpnIntent)
+        // Save current config
+        sessionManager.saveLastServer(serverConfig)
+        sessionManager.saveLastSni(config.sni)
+        sessionManager.saveLastMode(config.connectionMode.displayName)
+        sessionManager.saveLastPayload(config.payload)
+
+        pendingConfig = config
+        requestVpnPermission()
+    }
+
+    private fun buildConfigFromInputs(): VpnConfig {
+        val serverConfig = etServerConfig.text?.toString()?.trim() ?: ""
+        val baseConfig = VpnConfig.parseServerConfig(serverConfig)
+
+        val sni = etSni.text?.toString()?.trim() ?: ""
+        val payload = etPayload.text?.toString()?.trim() ?: ""
+        val modeName = spinnerMode.text?.toString() ?: VpnConfig.ConnectionMode.SSL_TLS_SNI.displayName
+        val mode = VpnConfig.ConnectionMode.values().find { it.displayName == modeName }
+            ?: VpnConfig.ConnectionMode.SSL_TLS_SNI
+
+        return baseConfig.copy(
+            sni = sni,
+            payload = payload,
+            connectionMode = mode,
+            name = "${baseConfig.serverAddress}:${baseConfig.serverPort}"
+        )
+    }
+
+    private fun requestVpnPermission() {
+        val intent = VpnService.prepare(this)
+        if (intent != null) {
+            vpnPermissionLauncher.launch(intent)
         } else {
+            // VPN permission already granted
             startVpn()
         }
     }
 
     private fun startVpn() {
-        val config = pendingConfig ?: return
+        val config = pendingConfig ?: buildConfigFromInputs()
         val intent = Intent(this, VpnTunnelService::class.java).apply {
             action = VpnTunnelService.ACTION_CONNECT
             putExtra("config", config)
         }
-        startForegroundService(intent)
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            startForegroundService(intent)
+        } else {
+            startService(intent)
+        }
     }
 
     private fun stopVpn() {
         val intent = Intent(this, VpnTunnelService::class.java).apply {
             action = VpnTunnelService.ACTION_DISCONNECT
         }
-        startForegroundService(intent)
+        startService(intent)
     }
 
     private fun showSaveConfigDialog() {
-        val dialogView = layoutInflater.inflate(R.layout.dialog_save_config, null)
-        val etConfigName = dialogView.findViewById<TextInputEditText>(R.id.etConfigName)
+        val input = TextInputEditText(this)
+        input.hint = "Configuration name"
+        val config = buildConfigFromInputs()
+        input.setText(config.name)
 
         AlertDialog.Builder(this)
             .setTitle("Save Configuration")
-            .setView(dialogView)
+            .setView(input)
             .setPositiveButton("Save") { _, _ ->
-                val name = etConfigName.text.toString().trim()
-                if (name.isNotEmpty()) {
-                    val config = buildConfigFromInputs().copy(name = name)
-                    saveConfig(config)
-                    Toast.makeText(this, "Configuration saved", Toast.LENGTH_SHORT).show()
-                }
+                val name = input.text?.toString()?.trim() ?: "Config"
+                val savedConfig = config.copy(name = name)
+                saveConfig(savedConfig)
+                Toast.makeText(this, "Configuration saved", Toast.LENGTH_SHORT).show()
             }
             .setNegativeButton("Cancel", null)
             .show()
@@ -270,6 +305,13 @@ class MainActivity : AppCompatActivity() {
             .show()
     }
 
+    private fun populateInputs(config: VpnConfig) {
+        etServerConfig.setText(config.toServerString())
+        etSni.setText(config.sni)
+        etPayload.setText(config.payload)
+        spinnerMode.setText(config.connectionMode.displayName, false)
+    }
+
     private fun saveConfig(config: VpnConfig) {
         val configs = sessionManager.getSavedConfigs().toMutableList()
         configs.removeAll { it.name == config.name }
@@ -298,6 +340,7 @@ class MainActivity : AppCompatActivity() {
     private fun updateUI() {
         val state = VpnTunnelService.getState()
         val config = VpnTunnelService.getCurrentConfig()
+        val lastError = VpnTunnelService.getLastError()
 
         when (state) {
             ConnectionState.CONNECTED -> {
@@ -325,7 +368,13 @@ class MainActivity : AppCompatActivity() {
                 statusIcon.setColorFilter(Color.parseColor("#F44336"))
                 btnConnect.text = "Connect"
                 btnConnect.backgroundTintList = ColorStateList.valueOf(Color.parseColor("#00C853"))
-                connectionInfo.visibility = View.GONE
+                if (lastError != null) {
+                    connectionInfo.text = lastError
+                    connectionInfo.setTextColor(Color.parseColor("#F44336"))
+                    connectionInfo.visibility = View.VISIBLE
+                } else {
+                    connectionInfo.visibility = View.GONE
+                }
             }
             else -> {
                 statusText.text = "Disconnected"

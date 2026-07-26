@@ -30,56 +30,66 @@ data class VpnConfig(
     }
 
     fun toServerString(): String {
-        return if (username.isNotEmpty() && password.isNotEmpty()) {
-            "$serverAddress:$serverPort@$username:$password"
-        } else if (serverPort != 443) {
+        val server = if (serverPort != 443) {
             "$serverAddress:$serverPort"
         } else {
             serverAddress
         }
+        return if (username.isNotEmpty() && password.isNotEmpty()) {
+            "$server@$username:$password"
+        } else {
+            server
+        }
     }
 
     companion object {
+        /**
+         * Parses server config in format: ip:port@username:password
+         * Example: 1.2.3.4:443@user:pass
+         * Port defaults to 443, username/password are optional.
+         */
         fun parseServerConfig(input: String): VpnConfig {
             val trimmed = input.trim()
             if (trimmed.isEmpty()) {
                 return VpnConfig()
             }
 
-            var address = trimmed
-            var port = 443
+            var addressPart = trimmed
             var username = ""
             var password = ""
 
-            // Extract user:pass@ part
+            // Extract credentials after @
             val atIdx = trimmed.lastIndexOf('@')
             if (atIdx > 0) {
-                val userPass = trimmed.substring(0, atIdx)
-                address = trimmed.substring(atIdx + 1)
+                addressPart = trimmed.substring(0, atIdx)
+                val credentials = trimmed.substring(atIdx + 1)
 
-                val colonIdx = userPass.indexOf(':')
+                val colonIdx = credentials.indexOf(':')
                 if (colonIdx > 0) {
-                    username = userPass.substring(0, colonIdx)
-                    password = userPass.substring(colonIdx + 1)
+                    username = credentials.substring(0, colonIdx)
+                    password = credentials.substring(colonIdx + 1)
                 } else {
-                    username = userPass
+                    username = credentials
                 }
             }
 
             // Extract ip:port
-            val colonIdx = address.lastIndexOf(':')
+            var serverAddress = addressPart
+            var serverPort = 443
+
+            val colonIdx = addressPart.lastIndexOf(':')
             if (colonIdx > 0) {
-                val portStr = address.substring(colonIdx + 1)
+                val portStr = addressPart.substring(colonIdx + 1)
                 val portNum = portStr.toIntOrNull()
-                if (portNum != null) {
-                    port = portNum
-                    address = address.substring(0, colonIdx)
+                if (portNum != null && portNum in 1..65535) {
+                    serverPort = portNum
+                    serverAddress = addressPart.substring(0, colonIdx)
                 }
             }
 
             return VpnConfig(
-                serverAddress = address,
-                serverPort = port,
+                serverAddress = serverAddress,
+                serverPort = serverPort,
                 username = username,
                 password = password
             )

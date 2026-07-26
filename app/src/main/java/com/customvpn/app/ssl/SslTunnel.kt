@@ -38,6 +38,10 @@ class SslTunnel(
         listener?.onLog("Starting SSL/TLS tunnel to ${config.serverAddress}:${config.serverPort}")
         listener?.onLog("SNI: ${config.sni.ifEmpty { "(none)" }}")
 
+        if (config.serverAddress.isEmpty()) {
+            throw IOException("Server address is empty")
+        }
+
         try {
             serverSocket = java.net.ServerSocket(localBindPort, 1, java.net.InetAddress.getByName("127.0.0.1"))
             localPort = serverSocket!!.localPort
@@ -56,11 +60,49 @@ class SslTunnel(
                 }
             }.start()
 
+            // Test that we can actually connect to the remote server
+            Thread {
+                try {
+                    testSslConnection()
+                } catch (e: Exception) {
+                    listener?.onError("SSL pre-check failed: ${e.message}")
+                }
+            }.start()
+
             return localPort
         } catch (e: Exception) {
             listener?.onError("Failed to start SSL tunnel: ${e.message}")
             stop()
             throw e
+        }
+    }
+
+    private fun testSslConnection() {
+        listener?.onLog("Testing SSL connection to ${config.serverAddress}:${config.serverPort}...")
+        try {
+            val sslContext = SSLContext.getInstance("TLS")
+            sslContext.init(null, arrayOf<TrustManager>(trustAllManager), SecureRandom())
+
+            val factory = sslContext.socketFactory as SSLSocketFactory
+            val sock = factory.createSocket() as SSLSocket
+
+            val sniHost = config.sni.ifEmpty { config.serverAddress }
+
+            // Set SNI
+            val params = sock.sslParameters
+            try {
+                val sniNames = listOf(SNIHostName(sniHost))
+                params.setServerNames(sniNames)
+            } catch (_: Exception) {}
+
+            sock.connect(InetSocketAddress(config.serverAddress, config.serverPort), 10000)
+            sock.soTimeout = 10000
+            sock.startHandshake()
+
+            listener?.onLog("SSL pre-check: connection to $sniHost successful")
+            sock.close()
+        } catch (e: Exception) {
+            listener?.onLog("SSL pre-check failed: ${e.message} (non-fatal, will retry on client connect)")
         }
     }
 
@@ -146,24 +188,13 @@ class SslTunnel(
 
             val sniHost = config.sni.ifEmpty { targetHost }
 
-            // Set SNI via SSLParameters
+            // Set SNI via SSLParameters before connecting
             val params = sock.sslParameters
-            params.setEndpointIdentificationAlgorithm("HTTPS")
-            val sniHostNames = listOf(sniHost)
-            params.setServerNames(listOf(SNIHostName(sniHost)))
-
-            sock.connect(InetSocketAddress(config.serverAddress, config.serverPort), 15000)
-            sock.soTimeout = 60000
-
-            // Apply SNI params before handshake
             try {
-                val paramsField = sock.javaClass.getDeclaredField("sslParameters")
-                paramsField.isAccessible = true
-                val sslParams = paramsField.get(sock)
-                val sniField = sslParams.javaClass.getDeclaredMethod("setServerNames", java.util.List::class.java)
-                sniField.invoke(sslParams, sniHostNames)
-            } catch (_: Exception) {
-                // Fallback: set hostname via reflection
+                val sniNames = listOf(SNIHostName(sniHost))
+                params.setServerNames(sniNames)
+            } catch (e: Exception) {
+                listener?.onLog("SNI setServerNames failed, trying reflection: ${e.message}")
                 try {
                     val hostnameField = sock.javaClass.getDeclaredField("host")
                     hostnameField.isAccessible = true
@@ -171,19 +202,22 @@ class SslTunnel(
                 } catch (_: Exception) {}
             }
 
+            sock.connect(InetSocketAddress(config.serverAddress, config.serverPort), 15000)
+            sock.soTimeout = 60000
+
             sock.startHandshake()
             listener?.onLog("SSL/TLS handshake completed with SNI: $sniHost")
 
             sock
         } catch (e: Exception) {
-            listener?.onError("SSL connection failed to $targetHost:$targetPort: ${e.message}")
+            listener?.onError("SSL connection failed to ${config.serverAddress}:${config.serverPort} (SNI: $targetHost): ${e.message}")
             null
         }
     }
 
     private fun pipe(local: Socket, remote: SSLSocket) {
         try {
-            Thread {
+            val toRemote = Thread {
                 try {
                     val buf = ByteArray(32768)
                     val input = local.getInputStream()
@@ -197,7 +231,9 @@ class SslTunnel(
                 finally {
                     try { remote.close() } catch (_: Exception) {}
                 }
-            }.start()
+            }
+            toRemote.isDaemon = true
+            toRemote.start()
 
             val buf = ByteArray(32768)
             val input = remote.inputStream

@@ -2,6 +2,7 @@ package com.customvpn.app.ssh
 
 import com.customvpn.app.models.VpnConfig
 import java.io.*
+import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.Socket
 import java.nio.ByteBuffer
@@ -61,38 +62,100 @@ class SshTunnel(
         try {
             clientSocket.soTimeout = 30000
 
-            val headerBuf = ByteArray(1024)
+            val buf = ByteArray(1024)
             val input = clientSocket.getInputStream()
-            val headerLen = input.read(headerBuf)
-            if (headerLen <= 0) {
+            val readLen = input.read(buf)
+            if (readLen <= 0) {
                 clientSocket.close()
                 return
             }
 
-            val headerStr = String(headerBuf, 0, headerLen, Charsets.US_ASCII)
+            val headerStr = String(buf, 0, readLen, Charsets.US_ASCII)
 
             if (headerStr.startsWith("GET ") || headerStr.startsWith("POST ") || headerStr.startsWith("CONNECT ")) {
-                handleHttpProxy(clientSocket, headerBuf, headerLen, headerStr)
+                handleHttpProxy(clientSocket, buf, readLen, headerStr)
                 return
             }
 
-            val firstLine = headerStr.split("\r\n").firstOrNull() ?: ""
-            val parts = firstLine.split(" ")
-            if (parts.size >= 3) {
-                val host = parts[1].substringBefore(":")
-                val port = parts[1].substringAfter(":").toIntOrNull() ?: 22
+            // SOCKS5 protocol
+            if (buf[0] == 0x05.toByte()) {
+                // Greeting: version + nmethods + methods
+                // Reply with no-auth
+                clientSocket.getOutputStream().write(byteArrayOf(0x05, 0x00))
+                clientSocket.getOutputStream().flush()
 
-                remoteSocket = createSshConnection(host, port)
+                // Read CONNECT request
+                val connectBuf = ByteArray(256)
+                val connectLen = input.read(connectBuf)
+                if (connectLen < 7) {
+                    clientSocket.close()
+                    return
+                }
+
+                val cmd = connectBuf[1].toInt() and 0xFF
+                if (cmd != 0x01) { // Only CONNECT supported
+                    clientSocket.getOutputStream().write(byteArrayOf(0x05, 0x07, 0x00, 0x01, 0, 0, 0, 0, 0, 0))
+                    clientSocket.getOutputStream().flush()
+                    clientSocket.close()
+                    return
+                }
+
+                val atyp = connectBuf[3].toInt() and 0xFF
+                val targetHost: String
+                val targetPort: Int
+
+                when (atyp) {
+                    0x01 -> { // IPv4
+                        if (connectLen < 10) { clientSocket.close(); return }
+                        targetHost = "${connectBuf[4].toInt() and 0xFF}.${connectBuf[5].toInt() and 0xFF}.${connectBuf[6].toInt() and 0xFF}.${connectBuf[7].toInt() and 0xFF}"
+                        targetPort = ((connectBuf[8].toInt() and 0xFF) shl 8) or (connectBuf[9].toInt() and 0xFF)
+                    }
+                    0x03 -> { // Domain
+                        val domainLen = connectBuf[4].toInt() and 0xFF
+                        if (connectLen < 5 + domainLen + 2) { clientSocket.close(); return }
+                        targetHost = String(connectBuf, 5, domainLen)
+                        targetPort = ((connectBuf[5 + domainLen].toInt() and 0xFF) shl 8) or (connectBuf[6 + domainLen].toInt() and 0xFF)
+                    }
+                    0x04 -> { // IPv6
+                        if (connectLen < 22) { clientSocket.close(); return }
+                        val ipv6 = ByteArray(16)
+                        System.arraycopy(connectBuf, 4, ipv6, 0, 16)
+                        targetHost = InetAddress.getByAddress(ipv6).hostAddress ?: ""
+                        targetPort = ((connectBuf[20].toInt() and 0xFF) shl 8) or (connectBuf[21].toInt() and 0xFF)
+                    }
+                    else -> {
+                        clientSocket.getOutputStream().write(byteArrayOf(0x05, 0x08, 0x00, 0x01, 0, 0, 0, 0, 0, 0))
+                        clientSocket.getOutputStream().flush()
+                        clientSocket.close()
+                        return
+                    }
+                }
+
+                listener?.onLog("SOCKS5 CONNECT to $targetHost:$targetPort")
+                remoteSocket = createSshConnection(targetHost, targetPort)
                 if (remoteSocket != null) {
-                    sendSocksResponse(clientSocket, 0)
-                    pipe(clientSocket, remoteSocket, headerBuf, 0, headerLen)
+                    // Success reply
+                    val reply = ByteArray(10)
+                    reply[0] = 0x05
+                    reply[1] = 0x00 // Success
+                    reply[2] = 0x00
+                    reply[3] = 0x01
+                    clientSocket.getOutputStream().write(reply)
+                    clientSocket.getOutputStream().flush()
+
+                    pipe(clientSocket, remoteSocket, null, 0, 0)
                 } else {
-                    sendSocksResponse(clientSocket, 1)
+                    // Failure reply
+                    val reply = byteArrayOf(0x05, 0x05, 0x00, 0x01, 0, 0, 0, 0, 0, 0)
+                    clientSocket.getOutputStream().write(reply)
+                    clientSocket.getOutputStream().flush()
                     clientSocket.close()
                 }
-            } else {
-                clientSocket.close()
+                return
             }
+
+            // Fallback - try as raw proxy
+            clientSocket.close()
         } catch (e: Exception) {
             listener?.onLog("Client connection error: ${e.message}")
             try { clientSocket.close() } catch (_: Exception) {}
@@ -154,7 +217,7 @@ class SshTunnel(
             sock.getOutputStream().write(connectPacket)
             sock.getOutputStream().flush()
 
-            val response = ByteArray(1024)
+            val response = ByteArray(10)
             val readLen = sock.getInputStream().read(response)
             if (readLen > 0) {
                 val respStr = String(response, 0, readLen)
