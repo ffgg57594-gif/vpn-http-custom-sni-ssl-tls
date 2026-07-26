@@ -36,7 +36,7 @@ class SslTunnel(
     fun start(localBindPort: Int = 0): Int {
         isRunning = true
         listener?.onLog("Starting SSL/TLS tunnel to ${config.serverAddress}:${config.serverPort}")
-        listener?.onLog("SNI: ${config.sni.ifEmpty { "(none)" }}")
+        listener?.onLog("SNI: ${config.sni.ifEmpty { config.serverAddress }}")
 
         if (config.serverAddress.isEmpty()) {
             throw IOException("Server address is empty")
@@ -45,7 +45,7 @@ class SslTunnel(
         try {
             serverSocket = java.net.ServerSocket(localBindPort, 1, java.net.InetAddress.getByName("127.0.0.1"))
             localPort = serverSocket!!.localPort
-            listener?.onLog("Local proxy listening on port $localPort")
+            listener?.onLog("Local HTTP proxy listening on port $localPort")
 
             Thread {
                 try {
@@ -60,49 +60,11 @@ class SslTunnel(
                 }
             }.start()
 
-            // Test that we can actually connect to the remote server
-            Thread {
-                try {
-                    testSslConnection()
-                } catch (e: Exception) {
-                    listener?.onError("SSL pre-check failed: ${e.message}")
-                }
-            }.start()
-
             return localPort
         } catch (e: Exception) {
             listener?.onError("Failed to start SSL tunnel: ${e.message}")
             stop()
             throw e
-        }
-    }
-
-    private fun testSslConnection() {
-        listener?.onLog("Testing SSL connection to ${config.serverAddress}:${config.serverPort}...")
-        try {
-            val sslContext = SSLContext.getInstance("TLS")
-            sslContext.init(null, arrayOf<TrustManager>(trustAllManager), SecureRandom())
-
-            val factory = sslContext.socketFactory as SSLSocketFactory
-            val sock = factory.createSocket() as SSLSocket
-
-            val sniHost = config.sni.ifEmpty { config.serverAddress }
-
-            // Set SNI
-            val params = sock.sslParameters
-            try {
-                val sniNames = listOf(SNIHostName(sniHost))
-                params.setServerNames(sniNames)
-            } catch (_: Exception) {}
-
-            sock.connect(InetSocketAddress(config.serverAddress, config.serverPort), 10000)
-            sock.soTimeout = 10000
-            sock.startHandshake()
-
-            listener?.onLog("SSL pre-check: connection to $sniHost successful")
-            sock.close()
-        } catch (e: Exception) {
-            listener?.onLog("SSL pre-check failed: ${e.message} (non-fatal, will retry on client connect)")
         }
     }
 
@@ -154,6 +116,7 @@ class SslTunnel(
             sslSocket = createSslConnection(targetHost, targetPort)
 
             if (sslSocket != null) {
+                listener?.onConnected()
                 if (isConnect) {
                     clientSocket.getOutputStream().write("HTTP/1.1 200 Connection Established\r\n\r\n".toByteArray())
                     clientSocket.getOutputStream().flush()
@@ -188,13 +151,11 @@ class SslTunnel(
 
             val sniHost = config.sni.ifEmpty { targetHost }
 
-            // Set SNI via SSLParameters before connecting
             val params = sock.sslParameters
             try {
                 val sniNames = listOf(SNIHostName(sniHost))
                 params.setServerNames(sniNames)
-            } catch (e: Exception) {
-                listener?.onLog("SNI setServerNames failed, trying reflection: ${e.message}")
+            } catch (_: Exception) {
                 try {
                     val hostnameField = sock.javaClass.getDeclaredField("host")
                     hostnameField.isAccessible = true
@@ -210,7 +171,7 @@ class SslTunnel(
 
             sock
         } catch (e: Exception) {
-            listener?.onError("SSL connection failed to ${config.serverAddress}:${config.serverPort} (SNI: $targetHost): ${e.message}")
+            listener?.onError("SSL connection failed to ${config.serverAddress}:${config.serverPort}: ${e.message}")
             null
         }
     }

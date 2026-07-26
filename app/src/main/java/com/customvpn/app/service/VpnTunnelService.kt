@@ -101,7 +101,6 @@ class VpnTunnelService : VpnService() {
 
         tunnelThread = Thread {
             try {
-                // Validate server config first
                 if (config.serverAddress.isEmpty()) {
                     setFailed("Server address is empty")
                     return@Thread
@@ -130,28 +129,22 @@ class VpnTunnelService : VpnService() {
 
     private fun connectSslSsh(config: VpnConfig) {
         addLog(LogEntry(level = LogEntry.Level.INFO, message = "Starting SSL/TLS tunnel with SNI..."))
-
-        // Validate server reachability first
-        addLog(LogEntry(level = LogEntry.Level.INFO, message = "Checking server reachability: ${config.serverAddress}:${config.serverPort}"))
-        if (!testServerReachability(config.serverAddress, config.serverPort)) {
-            setFailed("Server ${config.serverAddress}:${config.serverPort} is unreachable")
-            return
-        }
-        addLog(LogEntry(level = LogEntry.Level.INFO, message = "Server is reachable"))
+        addLog(LogEntry(level = LogEntry.Level.INFO, message = "Server: ${config.serverAddress}:${config.serverPort}"))
+        addLog(LogEntry(level = LogEntry.Level.INFO, message = "SNI: ${config.sni.ifEmpty { config.serverAddress }}"))
 
         sslTunnel = SslTunnel(config, object : SslTunnel.TunnelListener {
             override fun onConnected() {
                 addLog(LogEntry(level = LogEntry.Level.INFO, message = "SSL/TLS tunnel established"))
             }
-
             override fun onDisconnected(reason: String) {
                 addLog(LogEntry(level = LogEntry.Level.INFO, message = "SSL tunnel: $reason"))
+                if (isRunning) {
+                    setFailed("SSL tunnel disconnected: $reason")
+                }
             }
-
             override fun onError(error: String) {
                 addLog(LogEntry(level = LogEntry.Level.ERROR, message = "SSL error: $error"))
             }
-
             override fun onLog(message: String) {
                 addLog(LogEntry(level = LogEntry.Level.DEBUG, message = message))
             }
@@ -171,27 +164,19 @@ class VpnTunnelService : VpnService() {
     private fun connectSsh(config: VpnConfig) {
         addLog(LogEntry(level = LogEntry.Level.INFO, message = "Starting SSH tunnel..."))
 
-        val sshPort = if (config.sshPort > 0) config.sshPort else config.serverPort
-        addLog(LogEntry(level = LogEntry.Level.INFO, message = "Checking SSH server: ${config.serverAddress}:$sshPort"))
-        if (!testServerReachability(config.serverAddress, sshPort)) {
-            setFailed("SSH server ${config.serverAddress}:$sshPort is unreachable")
-            return
-        }
-        addLog(LogEntry(level = LogEntry.Level.INFO, message = "SSH server is reachable"))
-
         sshTunnel = SshTunnel(config, object : SshTunnel.TunnelListener {
             override fun onConnected() {
                 addLog(LogEntry(level = LogEntry.Level.INFO, message = "SSH tunnel established"))
             }
-
             override fun onDisconnected(reason: String) {
                 addLog(LogEntry(level = LogEntry.Level.INFO, message = "SSH tunnel: $reason"))
+                if (isRunning) {
+                    setFailed("SSH tunnel disconnected: $reason")
+                }
             }
-
             override fun onError(error: String) {
                 addLog(LogEntry(level = LogEntry.Level.ERROR, message = "SSH error: $error"))
             }
-
             override fun onLog(message: String) {
                 addLog(LogEntry(level = LogEntry.Level.DEBUG, message = message))
             }
@@ -208,26 +193,12 @@ class VpnTunnelService : VpnService() {
         establishVpn(config)
     }
 
-    private fun testServerReachability(host: String, port: Int): Boolean {
-        return try {
-            val socket = Socket()
-            protect(socket)
-            socket.connect(InetSocketAddress(host, port), 5000)
-            socket.close()
-            true
-        } catch (e: Exception) {
-            addLog(LogEntry(level = LogEntry.Level.WARNING, message = "Server test failed: ${e.message}"))
-            false
-        }
-    }
-
     private fun establishVpn(config: VpnConfig) {
         val builder = Builder()
         builder.setSession("Custom VPN")
         builder.setMtu(config.mtu)
         builder.addAddress("10.0.0.2", 32)
         builder.addRoute("0.0.0.0", 0)
-
         builder.addDnsServer(config.dns1)
         builder.addDnsServer(config.dns2)
 
@@ -271,7 +242,6 @@ class VpnTunnelService : VpnService() {
                 }
 
                 val version = (packet[0].toInt() and 0xF0) ushr 4
-
                 when (version) {
                     4 -> handleIPv4Packet(packet, length, output)
                     6 -> { /* IPv6 - skip */ }
@@ -309,84 +279,35 @@ class VpnTunnelService : VpnService() {
 
     private fun handleTcpPacket(packet: ByteArray, length: Int, vpnOutput: FileOutputStream) {
         try {
-            val tcpHeaderOffset = 20
-            if (length < tcpHeaderOffset + 20) return
+            val ipHeaderLen = (packet[0].toInt() and 0x0F) * 4
+            if (length < ipHeaderLen + 20) return
 
+            val tcpHeaderOffset = ipHeaderLen
             val tcpHeader = ByteBuffer.wrap(packet, tcpHeaderOffset, 20)
             tcpHeader.position(12)
             val flags = tcpHeader.get().toInt() and 0xFF
             val syn = (flags and 0x02) != 0
             val ack = (flags and 0x10) != 0
+            val fin = (flags and 0x01) != 0
 
-            tcpHeader.position(2)
-            val dstPort = tcpHeader.short.toInt() and 0xFFFF
-
+            val dstPort = ByteBuffer.wrap(packet, tcpHeaderOffset + 2, 2).short.toInt() and 0xFFFF
             val srcPort = ByteBuffer.wrap(packet, tcpHeaderOffset, 2).short.toInt() and 0xFFFF
 
             val dstAddr = InetAddress.getByAddress(byteArrayOf(packet[16], packet[17], packet[18], packet[19]))
+            val srcAddr = InetAddress.getByAddress(byteArrayOf(packet[12], packet[13], packet[14], packet[15]))
 
-            // DNS port 53 goes through direct UDP proxy
             if (dstPort == 53) {
-                handleTcpDns(packet, length, vpnOutput, tcpHeaderOffset, srcPort, dstAddr)
+                handleTcpDns(packet, length, vpnOutput, ipHeaderLen, srcPort, srcAddr, dstAddr)
                 return
             }
 
             if (syn && !ack) {
-                // New connection - connect through our local proxy
-                Thread {
-                    try {
-                        val client = Socket()
-                        protect(client)
-                        client.connect(InetSocketAddress("127.0.0.1", localProxyPort), 10000)
-
-                        val socksConnect = buildSocksConnect(
-                            dstAddr.hostAddress ?: "0.0.0.0",
-                            dstPort
-                        )
-                        client.outputStream.write(socksConnect)
-                        client.outputStream.flush()
-
-                        val response = ByteArray(10)
-                        val readLen = client.inputStream.read(response)
-                        if (readLen < 2 || response[1] != 0x00.toByte()) {
-                            client.close()
-                            return@Thread
-                        }
-
-                        val localSockPort = client.localPort
-                        activeConnections[localSockPort] = client
-
-                        // Rewrite packet to go through our proxy
-                        rewriteDstPort(packet, tcpHeaderOffset, localSockPort)
-                        rewriteDstAddr(packet, byteArrayOf(127, 0, 0, 1))
-                        rewriteSrcPort(packet, tcpHeaderOffset, localSockPort)
-                        recalculateChecksums(packet, length)
-                        vpnOutput.write(packet, 0, length)
-                        vpnOutput.flush()
-
-                        // Keep connection alive and forward data
-                        forwardProxiedTraffic(client, vpnOutput, srcPort)
-                    } catch (e: Exception) {
-                        Log.e(TAG, "TCP connect error: ${e.message}")
-                    }
-                }.start()
+                handleTcpSyn(packet, length, vpnOutput, ipHeaderLen, tcpHeaderOffset, srcPort, dstPort, srcAddr, dstAddr)
+            } else if (fin) {
+                handleTcpFin(packet, length, vpnOutput, ipHeaderLen, tcpHeaderOffset, srcPort, srcAddr, dstAddr)
             } else if (activeConnections.containsKey(srcPort)) {
-                // Existing connection - forward data through proxy
-                Thread {
-                    try {
-                        val client = activeConnections[srcPort] ?: return@Thread
-                        // Rewrite destination to local proxy
-                        rewriteDstPort(packet, tcpHeaderOffset, localProxyPort)
-                        rewriteDstAddr(packet, byteArrayOf(127, 0, 0, 1))
-                        recalculateChecksums(packet, length)
-                        vpnOutput.write(packet, 0, length)
-                        vpnOutput.flush()
-                    } catch (e: Exception) {
-                        Log.e(TAG, "TCP forward error: ${e.message}")
-                    }
-                }.start()
+                handleTcpData(packet, length, vpnOutput, ipHeaderLen, tcpHeaderOffset, srcPort, srcAddr, dstAddr)
             } else {
-                // Other TCP packets - just recalculate and write
                 recalculateChecksums(packet, length)
                 vpnOutput.write(packet, 0, length)
                 vpnOutput.flush()
@@ -396,48 +317,136 @@ class VpnTunnelService : VpnService() {
         }
     }
 
-    private fun handleTcpDns(packet: ByteArray, length: Int, vpnOutput: FileOutputStream, tcpHeaderOffset: Int, srcPort: Int, dstAddr: InetAddress) {
+    private fun handleTcpSyn(
+        packet: ByteArray, length: Int, vpnOutput: FileOutputStream,
+        ipHeaderLen: Int, tcpHeaderOffset: Int,
+        srcPort: Int, dstPort: Int,
+        srcAddr: InetAddress, dstAddr: InetAddress
+    ) {
         Thread {
             try {
                 val client = Socket()
                 protect(client)
                 client.connect(InetSocketAddress("127.0.0.1", localProxyPort), 10000)
 
-                val socksConnect = buildSocksConnect(dstAddr.hostAddress ?: "0.0.0.0", 53)
-                client.outputStream.write(socksConnect)
+                val connectRequest = "CONNECT ${dstAddr.hostAddress}:$dstPort HTTP/1.1\r\nHost: ${dstAddr.hostAddress}:$dstPort\r\nProxy-Connection: keep-alive\r\n\r\n"
+                client.outputStream.write(connectRequest.toByteArray())
                 client.outputStream.flush()
 
-                val response = ByteArray(10)
+                val response = ByteArray(1024)
                 val readLen = client.inputStream.read(response)
-                if (readLen < 2 || response[1] != 0x00.toByte()) {
+                if (readLen <= 0) {
+                    client.close()
+                    return@Thread
+                }
+
+                val responseStr = String(response, 0, readLen)
+                if (!responseStr.contains("200") && !responseStr.contains("HTTP")) {
+                    addLog(LogEntry(level = LogEntry.Level.WARNING, message = "Proxy rejected: ${responseStr.take(100)}"))
                     client.close()
                     return@Thread
                 }
 
                 activeConnections[srcPort] = client
-                rewriteDstPort(packet, tcpHeaderOffset, client.localPort)
-                rewriteDstAddr(packet, byteArrayOf(127, 0, 0, 1))
-                recalculateChecksums(packet, length)
-                vpnOutput.write(packet, 0, length)
-                vpnOutput.flush()
+                addLog(LogEntry(level = LogEntry.Level.DEBUG, message = "TCP connected: ${dstAddr.hostAddress}:$dstPort"))
 
-                forwardProxiedTraffic(client, vpnOutput, srcPort)
+                val localSockPort = client.localPort
+                sendTcpResponse(vpnOutput, srcAddr, dstAddr, dstPort, srcPort, length, flags = 0x12, window = 65535)
+
+                forwardProxiedTraffic(client, vpnOutput, srcPort, srcAddr, dstAddr, dstPort, ipHeaderLen)
+
             } catch (e: Exception) {
-                Log.e(TAG, "TCP DNS error: ${e.message}")
+                Log.e(TAG, "TCP SYN error: ${e.message}")
+                activeConnections.remove(srcPort)
             }
         }.start()
     }
 
-    private fun forwardProxiedTraffic(client: Socket, vpnOutput: FileOutputStream, originalSrcPort: Int) {
+    private fun handleTcpData(
+        packet: ByteArray, length: Int, vpnOutput: FileOutputStream,
+        ipHeaderLen: Int, tcpHeaderOffset: Int,
+        srcPort: Int,
+        srcAddr: InetAddress, dstAddr: InetAddress
+    ) {
+        Thread {
+            try {
+                val client = activeConnections[srcPort] ?: return@Thread
+                val payloadOffset = tcpHeaderLen(packet, ipHeaderLen) + ipHeaderLen
+                val payloadLength = length - payloadOffset
+                if (payloadLength > 0) {
+                    val payload = ByteArray(payloadLength)
+                    System.arraycopy(packet, payloadOffset, payload, 0, payloadLength)
+                    client.outputStream.write(payload)
+                    client.outputStream.flush()
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "TCP data forward error: ${e.message}")
+                activeConnections.remove(srcPort)
+            }
+        }.start()
+    }
+
+    private fun handleTcpFin(
+        packet: ByteArray, length: Int, vpnOutput: FileOutputStream,
+        ipHeaderLen: Int, tcpHeaderOffset: Int,
+        srcPort: Int,
+        srcAddr: InetAddress, dstAddr: InetAddress
+    ) {
+        val client = activeConnections.remove(srcPort)
+        try { client?.close() } catch (_: Exception) {}
+
+        sendTcpResponse(vpnOutput, srcAddr, dstAddr, 0, srcPort, length, flags = 0x14, window = 0)
+    }
+
+    private fun forwardProxiedTraffic(
+        client: Socket, vpnOutput: FileOutputStream, originalSrcPort: Int,
+        srcAddr: InetAddress, dstAddr: InetAddress, dstPort: Int, ipHeaderLen: Int
+    ) {
         try {
             val buf = ByteArray(32767)
             val input = client.getInputStream()
             while (isRunning) {
                 val n = input.read(buf)
                 if (n == -1) break
-                // Forward response back through VPN
-                // Build IP response packet with swapped src/dst
-                vpnOutput.write(buf, 0, n)
+
+                val tcpHeaderLen = 20
+                val ipLen = ipHeaderLen + tcpHeaderLen + n
+                val responsePacket = ByteArray(ipLen)
+
+                responsePacket[0] = 0x45.toByte()
+                responsePacket[1] = 0x00
+                responsePacket[2] = ((ipLen shr 8) and 0xFF).toByte()
+                responsePacket[3] = (ipLen and 0xFF).toByte()
+                responsePacket[4] = 0x00
+                responsePacket[5] = 0x00
+                responsePacket[6] = 0x40.toByte()
+                responsePacket[7] = 0x00
+                responsePacket[8] = 64
+                responsePacket[9] = 6
+
+                System.arraycopy(dstAddr.address, 0, responsePacket, 12, 4)
+                System.arraycopy(srcAddr.address, 0, responsePacket, 16, 4)
+
+                val tcpOffset = ipHeaderLen
+                responsePacket[tcpOffset] = ((dstPort shr 8) and 0xFF).toByte()
+                responsePacket[tcpOffset + 1] = (dstPort and 0xFF).toByte()
+                responsePacket[tcpOffset + 2] = ((originalSrcPort shr 8) and 0xFF).toByte()
+                responsePacket[tcpOffset + 3] = (originalSrcPort and 0xFF).toByte()
+
+                responsePacket[tcpOffset + 4] = 0
+                responsePacket[tcpOffset + 5] = 0
+                responsePacket[tcpOffset + 6] = 0
+                responsePacket[tcpOffset + 7] = 0
+
+                responsePacket[tcpOffset + 12] = 0x50.toByte()
+                responsePacket[tcpOffset + 13] = 0x10
+                responsePacket[tcpOffset + 14] = 0x00
+                responsePacket[tcpOffset + 15] = 0x01
+
+                System.arraycopy(buf, 0, responsePacket, tcpOffset + tcpHeaderLen, n)
+
+                recalculateChecksums(responsePacket, ipLen)
+                vpnOutput.write(responsePacket, 0, ipLen)
                 vpnOutput.flush()
             }
         } catch (_: Exception) {
@@ -447,14 +456,81 @@ class VpnTunnelService : VpnService() {
         }
     }
 
+    private fun handleTcpDns(
+        packet: ByteArray, length: Int, vpnOutput: FileOutputStream,
+        ipHeaderLen: Int, srcPort: Int,
+        srcAddr: InetAddress, dstAddr: InetAddress
+    ) {
+        Thread {
+            try {
+                val client = Socket()
+                protect(client)
+                client.connect(InetSocketAddress("127.0.0.1", localProxyPort), 10000)
+
+                val connectRequest = "CONNECT ${dstAddr.hostAddress}:53 HTTP/1.1\r\nHost: ${dstAddr.hostAddress}:53\r\nProxy-Connection: keep-alive\r\n\r\n"
+                client.outputStream.write(connectRequest.toByteArray())
+                client.outputStream.flush()
+
+                val response = ByteArray(1024)
+                val readLen = client.inputStream.read(response)
+                if (readLen <= 0) {
+                    client.close()
+                    return@Thread
+                }
+
+                val tcpHeaderLen = 20
+                val ipLen = ipHeaderLen + tcpHeaderLen
+                val responsePacket = ByteArray(ipLen)
+
+                responsePacket[0] = 0x45.toByte()
+                responsePacket[1] = 0x00
+                responsePacket[2] = ((ipLen shr 8) and 0xFF).toByte()
+                responsePacket[3] = (ipLen and 0xFF).toByte()
+                responsePacket[4] = 0x00
+                responsePacket[5] = 0x00
+                responsePacket[6] = 0x40.toByte()
+                responsePacket[7] = 0x00
+                responsePacket[8] = 64
+                responsePacket[9] = 6
+
+                System.arraycopy(dstAddr.address, 0, responsePacket, 12, 4)
+                System.arraycopy(srcAddr.address, 0, responsePacket, 16, 4)
+
+                val tcpOffset = ipHeaderLen
+                responsePacket[tcpOffset] = ((53 shr 8) and 0xFF).toByte()
+                responsePacket[tcpOffset + 1] = (53 and 0xFF).toByte()
+                responsePacket[tcpOffset + 2] = ((srcPort shr 8) and 0xFF).toByte()
+                responsePacket[tcpOffset + 3] = (srcPort and 0xFF).toByte()
+
+                responsePacket[tcpOffset + 4] = 0
+                responsePacket[tcpOffset + 5] = 0
+                responsePacket[tcpOffset + 6] = 0
+                responsePacket[tcpOffset + 7] = 0
+
+                responsePacket[tcpOffset + 12] = 0x50.toByte()
+                responsePacket[tcpOffset + 13] = 0x14
+                responsePacket[tcpOffset + 14] = 0x00
+                responsePacket[tcpOffset + 15] = 0x01
+
+                recalculateChecksums(responsePacket, ipLen)
+                vpnOutput.write(responsePacket, 0, ipLen)
+                vpnOutput.flush()
+
+                client.close()
+            } catch (e: Exception) {
+                Log.e(TAG, "TCP DNS error: ${e.message}")
+            }
+        }.start()
+    }
+
     private fun handleUdpPacket(packet: ByteArray, length: Int, vpnOutput: FileOutputStream) {
         try {
-            val udpHeaderOffset = 20
-            if (length < udpHeaderOffset + 8) return
+            val ipHeaderLen = (packet[0].toInt() and 0x0F) * 4
+            if (length < ipHeaderLen + 8) return
 
-            val udpHeader = ByteBuffer.wrap(packet, udpHeaderOffset, 8)
-            val srcPort = udpHeader.short.toInt() and 0xFFFF
-            val dstPort = udpHeader.short.toInt() and 0xFFFF
+            val udpHeaderOffset = ipHeaderLen
+            val srcPort = ByteBuffer.wrap(packet, udpHeaderOffset, 2).short.toInt() and 0xFFFF
+            val dstPort = ByteBuffer.wrap(packet, udpHeaderOffset + 2, 2).short.toInt() and 0xFFFF
 
             if (dstPort == 53) {
                 val cfg = currentConfig
@@ -494,80 +570,94 @@ class VpnTunnelService : VpnService() {
         }
     }
 
-    private fun buildSocksConnect(host: String, port: Int): ByteArray {
-        val buf = ByteBuffer.allocate(512)
-        buf.put(0x05)  // SOCKS version
-        buf.put(0x01)  // 1 auth method
-        buf.put(0x00)  // No auth
-        buf.flip()
-        val greet = ByteArray(buf.remaining())
-        buf.get(greet)
+    private fun sendTcpResponse(
+        vpnOutput: FileOutputStream,
+        srcAddr: InetAddress, dstAddr: InetAddress,
+        srcPort: Int, dstPort: Int,
+        originalLength: Int, flags: Int, window: Int
+    ) {
+        try {
+            val ipHeaderLen = 20
+            val tcpHeaderLen = 20
+            val totalLen = ipHeaderLen + tcpHeaderLen
+            val packet = ByteArray(totalLen)
 
-        // CONNECT request
-        val connectBuf = ByteBuffer.allocate(512)
-        connectBuf.put(0x05)  // SOCKS version
-        connectBuf.put(0x01)  // CONNECT command
-        connectBuf.put(0x00)  // Reserved
-        connectBuf.put(0x03)  // Domain name
-        val hostBytes = host.toByteArray()
-        connectBuf.put(hostBytes.size.toByte())
-        connectBuf.put(hostBytes)
-        connectBuf.putShort(port.toShort())
-        val result = ByteArray(connectBuf.position())
-        connectBuf.flip()
-        connectBuf.get(result)
+            packet[0] = 0x45.toByte()
+            packet[1] = 0x00
+            packet[2] = ((totalLen shr 8) and 0xFF).toByte()
+            packet[3] = (totalLen and 0xFF).toByte()
+            packet[4] = 0x00
+            packet[5] = 0x00
+            packet[6] = 0x40.toByte()
+            packet[7] = 0x00
+            packet[8] = 64
+            packet[9] = 6
 
-        // Combine greet + connect
-        val combined = ByteArray(greet.size + result.size)
-        System.arraycopy(greet, 0, combined, 0, greet.size)
-        System.arraycopy(result, 0, combined, greet.size, result.size)
-        return combined
-    }
+            System.arraycopy(srcAddr.address, 0, packet, 12, 4)
+            System.arraycopy(dstAddr.address, 0, packet, 16, 4)
 
-    private fun rewriteDstPort(packet: ByteArray, tcpHeaderOffset: Int, newPort: Int) {
-        val buf = ByteBuffer.wrap(packet, tcpHeaderOffset + 2, 2)
-        buf.putShort(newPort.toShort())
-    }
+            val tcpOffset = ipHeaderLen
+            packet[tcpOffset] = ((srcPort shr 8) and 0xFF).toByte()
+            packet[tcpOffset + 1] = (srcPort and 0xFF).toByte()
+            packet[tcpOffset + 2] = ((dstPort shr 8) and 0xFF).toByte()
+            packet[tcpOffset + 3] = (dstPort and 0xFF).toByte()
 
-    private fun rewriteSrcPort(packet: ByteArray, tcpHeaderOffset: Int, newPort: Int) {
-        val buf = ByteBuffer.wrap(packet, tcpHeaderOffset, 2)
-        buf.putShort(newPort.toShort())
-    }
+            packet[tcpOffset + 4] = 0
+            packet[tcpOffset + 5] = 0
+            packet[tcpOffset + 6] = 0
+            packet[tcpOffset + 7] = 0
 
-    private fun rewriteDstAddr(packet: ByteArray, addr: ByteArray) {
-        packet[16] = addr[0]
-        packet[17] = addr[1]
-        packet[18] = addr[2]
-        packet[19] = addr[3]
+            packet[tcpOffset + 8] = 0
+            packet[tcpOffset + 9] = 0
+            packet[tcpOffset + 10] = 0
+            packet[tcpOffset + 11] = 1
+
+            packet[tcpOffset + 12] = 0x50.toByte()
+            packet[tcpOffset + 13] = flags.toByte()
+            packet[tcpOffset + 14] = ((window shr 8) and 0xFF).toByte()
+            packet[tcpOffset + 15] = (window and 0xFF).toByte()
+
+            recalculateChecksums(packet, totalLen)
+            vpnOutput.write(packet, 0, totalLen)
+            vpnOutput.flush()
+        } catch (e: Exception) {
+            Log.e(TAG, "Send TCP response error: ${e.message}")
+        }
     }
 
     private fun buildUdpResponse(originalPacket: ByteArray, dnsResponse: ByteArray, dnsLen: Int, udpOffset: Int): ByteArray {
-        val totalLen = 20 + 8 + dnsLen
+        val ipHeaderLen = 20
+        val totalLen = ipHeaderLen + 8 + dnsLen
         val result = ByteArray(totalLen)
 
-        System.arraycopy(originalPacket, 0, result, 0, 20)
-
-        result[12] = originalPacket[16]
-        result[13] = originalPacket[17]
-        result[14] = originalPacket[18]
-        result[15] = originalPacket[19]
-        result[16] = originalPacket[12]
-        result[17] = originalPacket[13]
-        result[18] = originalPacket[14]
-        result[19] = originalPacket[15]
-
+        result[0] = 0x45.toByte()
+        result[1] = 0x00
+        result[2] = ((totalLen shr 8) and 0xFF).toByte()
+        result[3] = (totalLen and 0xFF).toByte()
+        result[4] = 0x00
+        result[5] = 0x00
+        result[6] = 0x40.toByte()
+        result[7] = 0x00
+        result[8] = 64
         result[9] = 17
-        val ipHeaderBuf = ByteBuffer.wrap(result, 2, 2)
-        ipHeaderBuf.putShort(totalLen.toShort())
 
-        val udpBuf = ByteBuffer.wrap(result, 20, 8)
+        System.arraycopy(originalPacket, 16, result, 12, 4)
+        System.arraycopy(originalPacket, 12, result, 16, 4)
+
+        val udpBuf = ByteBuffer.wrap(result, ipHeaderLen, 8)
         udpBuf.putShort(originalPacket[udpOffset + 2].toUByte().toShort())
         udpBuf.putShort(originalPacket[udpOffset].toUByte().toShort())
         udpBuf.putShort((8 + dnsLen).toShort())
         udpBuf.putShort(0)
 
-        System.arraycopy(dnsResponse, 0, result, 28, dnsLen)
+        System.arraycopy(dnsResponse, 0, result, ipHeaderLen + 8, dnsLen)
+        recalculateChecksums(result, totalLen)
         return result
+    }
+
+    private fun tcpHeaderLen(packet: ByteArray, ipHeaderLen: Int): Int {
+        if (ipHeaderLen + 12 >= packet.size) return 20
+        return ((packet[ipHeaderLen + 12].toInt() and 0xF0) ushr 2)
     }
 
     private fun recalculateChecksums(packet: ByteArray, length: Int) {
@@ -654,11 +744,11 @@ class VpnTunnelService : VpnService() {
     }
 
     fun disconnect() {
+        val wasFailed = connectionState == ConnectionState.FAILED
         isRunning = false
         val wasConnected = connectionState == ConnectionState.CONNECTED
         connectionState = ConnectionState.DISCONNECTED
 
-        // Close all active proxy connections
         activeConnections.values.forEach { socket ->
             try { socket.close() } catch (_: Exception) {}
         }
@@ -676,7 +766,7 @@ class VpnTunnelService : VpnService() {
         stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()
 
-        if (wasConnected) {
+        if (wasConnected || wasFailed) {
             addLog(LogEntry(level = LogEntry.Level.INFO, message = "Disconnected"))
         }
     }
