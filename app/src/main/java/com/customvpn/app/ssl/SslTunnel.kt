@@ -3,6 +3,7 @@ package com.customvpn.app.ssl
 import com.customvpn.app.models.VpnConfig
 import com.customvpn.app.utils.PayloadBuilder
 import java.io.*
+import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.Socket
 import java.nio.ByteBuffer
@@ -273,7 +274,7 @@ class SslTunnel(
         return result
     }
 
-    private fun pipe(client: Socket, remote: Socket, initialData: ByteArray?, initialOffset: Int, initialLen: Int) {
+    private fun pipe(client: Socket, remote: Socket, initialData: ByteArray? = null, initialOffset: Int = 0, initialLen: Int = 0) {
         try {
             if (initialData != null && initialLen > 0) {
                 remote.getOutputStream().write(initialData, initialOffset, initialLen)
