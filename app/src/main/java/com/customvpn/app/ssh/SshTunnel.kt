@@ -5,7 +5,6 @@ import java.io.*
 import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.Socket
-import java.nio.ByteBuffer
 
 class SshTunnel(
     private val config: VpnConfig,
@@ -213,17 +212,20 @@ class SshTunnel(
                 sock.getOutputStream().write(payload.toByteArray())
                 sock.getOutputStream().flush()
                 Thread.sleep(200)
-            }
+            } else {
+                val sniHost = config.sni.ifEmpty { config.serverAddress }
+                val defaultPayload = "GET / HTTP/1.1
+Host: $sniHost
+User-Agent: Mozilla/5.0
+Connection: Upgrade
+Upgrade: websocket; HTTP/1.1
+Sec-WebSocket-Version: 13
+Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==
 
-            val connectPacket = buildSocksConnect(targetHost, targetPort)
-            sock.getOutputStream().write(connectPacket)
-            sock.getOutputStream().flush()
-
-            val response = ByteArray(10)
-            val readLen = sock.getInputStream().read(response)
-            if (readLen > 0) {
-                val respStr = String(response, 0, readLen)
-                listener?.onLog("SSH connect response: ${respStr.take(100)}")
+"
+                sock.getOutputStream().write(defaultPayload.toByteArray())
+                sock.getOutputStream().flush()
+                Thread.sleep(200)
             }
 
             sock
@@ -231,22 +233,6 @@ class SshTunnel(
             listener?.onError("SSH connection failed: ${e.message}")
             null
         }
-    }
-
-    private fun buildSocksConnect(host: String, port: Int): ByteArray {
-        val buf = ByteBuffer.allocate(512)
-        buf.put(0x05)
-        buf.put(0x01)
-        buf.put(0x00)
-        buf.put(0x03)
-        val hostBytes = host.toByteArray()
-        buf.put(hostBytes.size.toByte())
-        buf.put(hostBytes)
-        buf.putShort(port.toShort())
-        val result = ByteArray(buf.position())
-        buf.flip()
-        buf.get(result)
-        return result
     }
 
     private fun sendSocksResponse(clientSocket: Socket, status: Byte) {

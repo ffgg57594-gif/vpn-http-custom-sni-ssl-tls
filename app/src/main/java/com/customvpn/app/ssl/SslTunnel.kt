@@ -6,7 +6,6 @@ import java.io.*
 import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.Socket
-import java.nio.ByteBuffer
 import java.security.SecureRandom
 import java.security.cert.X509Certificate
 import javax.net.ssl.*
@@ -241,17 +240,22 @@ class SslTunnel(
                 sock.getOutputStream().flush()
                 Thread.sleep(200)
                 listener?.onLog("Payload sent through SSL tunnel")
-            }
+            } else {
+                // Send default HTTP upgrade payload when no custom payload is set
+                val sniHost = config.sni.ifEmpty { config.serverAddress }
+                val defaultPayload = "GET / HTTP/1.1
+Host: $sniHost
+User-Agent: Mozilla/5.0
+Connection: Upgrade
+Upgrade: websocket; HTTP/1.1
+Sec-WebSocket-Version: 13
+Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==
 
-            val connectPacket = buildSocksConnect(targetHost, targetPort)
-            sock.getOutputStream().write(connectPacket)
-            sock.getOutputStream().flush()
-
-            val response = ByteArray(10)
-            val readLen = sock.getInputStream().read(response)
-            if (readLen > 0) {
-                val respStr = String(response, 0, readLen)
-                listener?.onLog("SSL connect response: ${respStr.take(100)}")
+"
+                sock.getOutputStream().write(defaultPayload.toByteArray())
+                sock.getOutputStream().flush()
+                Thread.sleep(200)
+                listener?.onLog("Default payload sent through SSL tunnel")
             }
 
             sock
@@ -259,22 +263,6 @@ class SslTunnel(
             listener?.onError("SSL connection failed to ${config.serverAddress}:${config.serverPort}: ${e.message}")
             null
         }
-    }
-
-    private fun buildSocksConnect(host: String, port: Int): ByteArray {
-        val buf = ByteBuffer.allocate(512)
-        buf.put(0x05)
-        buf.put(0x01)
-        buf.put(0x00)
-        buf.put(0x03)
-        val hostBytes = host.toByteArray()
-        buf.put(hostBytes.size.toByte())
-        buf.put(hostBytes)
-        buf.putShort(port.toShort())
-        val result = ByteArray(buf.position())
-        buf.flip()
-        buf.get(result)
-        return result
     }
 
     private fun pipe(client: Socket, remote: Socket, initialData: ByteArray? = null, initialOffset: Int = 0, initialLen: Int = 0) {
