@@ -121,6 +121,7 @@ class VpnTunnelService : VpnService() {
         currentConfig = config
         isRunning = true
         addLog(LogEntry(level = LogEntry.Level.INFO, message = "Connecting via ${config.connectionMode.displayName}..."))
+        showNotification("Connecting via ${config.connectionMode.displayName}...")
 
         tunnelThread = Thread {
             try {
@@ -862,7 +863,6 @@ class VpnTunnelService : VpnService() {
         vpnInterface = null
 
         stopForeground(STOP_FOREGROUND_REMOVE)
-        stopSelf()
 
         if (wasConnected || wasFailed) {
             addLog(LogEntry(level = LogEntry.Level.INFO, message = "Disconnected"))
@@ -894,7 +894,15 @@ class VpnTunnelService : VpnService() {
     private fun showNotification(text: String) {
         val intent = Intent(this, com.customvpn.app.ui.MainActivity::class.java)
         val pendingIntent = PendingIntent.getActivity(
-            this, 0, intent, PendingIntent.FLAG_IMMUTABLE
+            this, 0, intent, PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+        )
+
+        val disconnectIntent = Intent(this, VpnTunnelService::class.java).apply {
+            action = ACTION_DISCONNECT
+        }
+        val disconnectPending = PendingIntent.getService(
+            this, 1, disconnectIntent,
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
         )
 
         val notification = Notification.Builder(this, CHANNEL_ID)
@@ -902,6 +910,7 @@ class VpnTunnelService : VpnService() {
             .setContentText(text)
             .setSmallIcon(R.drawable.ic_vpn_key)
             .setContentIntent(pendingIntent)
+            .addAction(R.drawable.ic_power_settings, "Disconnect", disconnectPending)
             .setOngoing(true)
             .build()
 
