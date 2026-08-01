@@ -682,35 +682,100 @@ class VpnTunnelService : VpnService() {
 
     /**
      * Performs a DNS query through the local proxy over TCP (RFC 7766).
-     * The local proxy (SslTunnel) opens a TLS connection to the remote
-     * server and forwards the query to a public DNS-over-TLS (DoT,
-     * RFC 7858) endpoint at port 853 using the same inner-SOCKS
-     * mechanism the regular HTTP CONNECT flow uses. The DNS response
-     * is length-prefixed and sent back to the local client. This
-     * avoids the unreliable direct UDP path while side-stepping the
-     * remote's port-53 block (which returns a fake 100 GB Content-
-     * Length page) and the DoH misinterpretation as a WebSocket
-     * upgrade.
+     *
+     * This uses the EXACT same path the regular HTTP CONNECT flow uses
+     * for any TCP traffic (we see "Proxy connected for ... 8.8.8.8:853"
+     * succeeding in the regular HTTP CONNECT logs). The local proxy
+     * accepts an HTTP CONNECT for 8.8.8.8:853 (Google DNS-over-TLS),
+     * opens a TLS tunnel to that endpoint, and pipes the DNS bytes
+     * back and forth.
+     *
+     * Why this works for DNS where the previous attempts didn't:
+     *   - Port 853 (DoT) is the only DNS-related port the remote
+     *     actually forwards. Port 53 is blocked (fake Content-Length:
+     *     100 GB page).
+     *   - Going through the HTTP CONNECT path means the SslTunnel
+     *     uses its own proven `handleHttpProxy` code, not the
+     *     custom inner-SOCKS / raw-bytes paths that all kept
+     *     getting misinterpreted or EOFed by the remote.
+     *
+     * Each candidate gets its own socket so a partial CONNECT
+     * response from one attempt doesn't pollute the next.
      */
     private fun dnsOverTcp(dnsData: ByteArray): ByteArray? {
+        val resolver = currentConfig?.dns1?.ifEmpty { "8.8.8.8" } ?: "8.8.8.8"
+        val candidates = listOf(
+            resolver,
+            "1.1.1.1",
+            "8.8.8.8",
+            "8.8.4.4"
+        )
+        // De-duplicate while preserving order
+        val tried = LinkedHashSet<String>().apply { addAll(candidates) }
+
+        for (host in tried) {
+            val response = tryDnsOverTcpOnHost(dnsData, host)
+            if (response != null) return response
+        }
+        addLog(LogEntry(level = LogEntry.Level.DEBUG, message = "DNS over TCP: all DoT candidates failed"))
+        return null
+    }
+
+    /**
+     * Open a fresh socket to the local proxy, send HTTP CONNECT
+     * to <host>:853, send the length-prefixed DNS query, read the
+     * length-prefixed response. Returns null on any failure.
+     */
+    private fun tryDnsOverTcpOnHost(dnsData: ByteArray, host: String): ByteArray? {
         var socket: Socket? = null
         try {
             socket = Socket()
             protect(socket)
             socket.connect(InetSocketAddress("127.0.0.1", localProxyPort), 15000)
-            socket.soTimeout = 20000
+            // Generous timeout: the SslTunnel has to open a fresh
+            // TLS to the remote, do the inner-SOCKS handshake, and
+            // pipe to <host>:853 before we get our DNS reply.
+            socket.soTimeout = 30000
             socket.tcpNoDelay = true
 
             val out = socket.getOutputStream()
             val input = socket.getInputStream()
 
-            // RFC 7766: DNS over TCP is prefixed with a 2-byte length.
+            // HTTP CONNECT to a public DoT endpoint on port 853.
+            // The SslTunnel sees this and uses the exact same code
+            // path as the regular HTTPS traffic: opens a new TLS
+            // connection to the remote, sends inner-SOCKS for the
+            // target, replies 200 to us, then bi-directionally
+            // pipes the bytes.
+            val connectReq = "CONNECT $host:853 HTTP/1.0\r\n" +
+                    "Host: $host\r\n" +
+                    "User-Agent: CustomVPN/1.0\r\n" +
+                    "\r\n"
+            out.write(connectReq.toByteArray(Charsets.US_ASCII))
+            out.flush()
+
+            val resp = readHttpResponse(socket)
+            if (resp == null) {
+                addLog(LogEntry(level = LogEntry.Level.DEBUG, message = "DNS over TCP: CONNECT to $host:853 timed out"))
+                return null
+            }
+            val respStr = String(resp, Charsets.US_ASCII)
+            if (!respStr.contains(" 200 ")) {
+                val preview = respStr.lineSequence().firstOrNull() ?: ""
+                addLog(LogEntry(level = LogEntry.Level.DEBUG, message = "DNS over TCP: CONNECT to $host:853 rejected: $preview"))
+                return null
+            }
+            addLog(LogEntry(level = LogEntry.Level.DEBUG, message = "DNS over TCP: CONNECT to $host:853 succeeded"))
+
+            // Send the length-prefixed DNS query (RFC 7766) on the
+            // now-transparent TCP forward.
             val len = dnsData.size
             out.write(((len shr 8) and 0xFF))
             out.write(len and 0xFF)
             out.write(dnsData)
             out.flush()
 
+            // Read the length-prefixed DNS response.
             val lenBuf = ByteArray(2)
             readFully(input, lenBuf)
             val respLen = ((lenBuf[0].toInt() and 0xFF) shl 8) or (lenBuf[1].toInt() and 0xFF)
@@ -718,12 +783,11 @@ class VpnTunnelService : VpnService() {
                 addLog(LogEntry(level = LogEntry.Level.DEBUG, message = "DNS over TCP: bad response length $respLen"))
                 return null
             }
-
             val resp = ByteArray(respLen)
             readFully(input, resp)
             return resp
         } catch (e: Exception) {
-            addLog(LogEntry(level = LogEntry.Level.DEBUG, message = "DNS over TCP failed: ${e.message}"))
+            addLog(LogEntry(level = LogEntry.Level.DEBUG, message = "DNS over TCP to $host:853 failed: ${e.message}"))
             return null
         } finally {
             try { socket?.close() } catch (_: Exception) {}
