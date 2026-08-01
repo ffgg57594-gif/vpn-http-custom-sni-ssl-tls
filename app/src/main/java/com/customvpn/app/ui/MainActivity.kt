@@ -1,6 +1,9 @@
 package com.customvpn.app.ui
 
 import android.app.Activity
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.content.Context
 import android.content.Intent
 import android.content.res.ColorStateList
 import android.graphics.Color
@@ -47,6 +50,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var btnOpenConfig: MaterialButton
     private lateinit var btnGeneratePayload: MaterialButton
     private lateinit var btnClearLogs: MaterialButton
+    private lateinit var btnCopyLogs: MaterialButton
 
     private val vpnPermissionLauncher = registerForActivityResult(
         ActivityResultContracts.StartActivityForResult()
@@ -88,6 +92,7 @@ class MainActivity : AppCompatActivity() {
         btnOpenConfig = findViewById(R.id.btnOpenConfig)
         btnGeneratePayload = findViewById(R.id.btnGeneratePayload)
         btnClearLogs = findViewById(R.id.btnClearLogs)
+        btnCopyLogs = findViewById(R.id.btnCopyLogs)
     }
 
     private fun setupToolbar() {
@@ -154,6 +159,35 @@ class MainActivity : AppCompatActivity() {
         btnClearLogs.setOnClickListener {
             logAdapter.setLogs(emptyList())
         }
+
+        btnCopyLogs.setOnClickListener {
+            copyLogsToClipboard()
+        }
+    }
+
+    private fun copyLogsToClipboard() {
+        val logs = VpnTunnelService.getLogs()
+        if (logs.isEmpty()) {
+            Toast.makeText(this, "No logs to copy", Toast.LENGTH_SHORT).show()
+            return
+        }
+        val dateFormat = java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.getDefault())
+        val text = buildString {
+            append("=== Custom VPN Logs ===\n")
+            append("Generated: ${java.util.Date()}\n")
+            append("State: ${VpnTunnelService.getState()}\n")
+            append("Server: ${VpnTunnelService.getCurrentConfig()?.let { "${it.serverAddress}:${it.serverPort}" } ?: "N/A"}\n")
+            append("=== Entries (${logs.size}) ===\n\n")
+            for (entry in logs) {
+                val time = dateFormat.format(java.util.Date(entry.timestamp))
+                append("[$time] [${entry.level.tag}] ${entry.message}\n")
+            }
+        }
+
+        val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+        val clip = ClipData.newPlainText("Custom VPN Logs", text)
+        clipboard.setPrimaryClip(clip)
+        Toast.makeText(this, "Copied ${logs.size} log entries to clipboard", Toast.LENGTH_SHORT).show()
     }
 
     private fun loadLastConfig() {
@@ -350,7 +384,8 @@ class MainActivity : AppCompatActivity() {
                 btnConnect.text = "Disconnect"
                 btnConnect.backgroundTintList = ColorStateList.valueOf(Color.parseColor("#B71C1C"))
                 if (config != null) {
-                    connectionInfo.text = "${config.connectionMode.displayName} \u2192 ${config.serverAddress}:${config.serverPort}"
+                    connectionInfo.text = "${config.connectionMode.displayName} → ${config.serverAddress}:${config.serverPort}"
+                    connectionInfo.setTextColor(Color.parseColor("#9E9E9E"))
                     connectionInfo.visibility = View.VISIBLE
                 }
             }
@@ -386,6 +421,7 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
+        // Always refresh logs from the service so the UI stays in sync.
         val logs = VpnTunnelService.getLogs()
         if (logAdapter.itemCount != logs.size) {
             logAdapter.setLogs(logs)

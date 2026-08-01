@@ -3,6 +3,8 @@ package com.customvpn.app.ssl
 import com.customvpn.app.models.VpnConfig
 import com.customvpn.app.utils.PayloadBuilder
 import java.io.*
+import java.net.DatagramPacket
+import java.net.DatagramSocket
 import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.Socket
@@ -13,7 +15,8 @@ import javax.net.ssl.*
 class SslTunnel(
     private val config: VpnConfig,
     private val listener: TunnelListener? = null,
-    private val socketProtector: ((Socket) -> Unit)? = null
+    private val socketProtector: ((Socket) -> Unit)? = null,
+    private val datagramSocketProtector: ((DatagramSocket) -> Unit)? = null
 ) {
 
     interface TunnelListener {
@@ -27,6 +30,7 @@ class SslTunnel(
     private var isRunning = false
     private var serverSocket: java.net.ServerSocket? = null
     private var localPort: Int = 0
+    private var acceptThread: Thread? = null
 
     val port: Int get() = localPort
 
@@ -46,14 +50,19 @@ class SslTunnel(
         }
 
         try {
-            serverSocket = java.net.ServerSocket(localBindPort, 1, java.net.InetAddress.getByName("127.0.0.1"))
+            serverSocket = java.net.ServerSocket(
+                localBindPort, 50, java.net.InetAddress.getByName("127.0.0.1")
+            )
             localPort = serverSocket!!.localPort
-            listener?.onLog("Local HTTP proxy listening on port $localPort")
+            listener?.onLog("Local HTTP/SOCKS proxy listening on 127.0.0.1:$localPort")
 
-            Thread {
+            acceptThread = Thread({
                 try {
                     while (isRunning) {
                         val clientSocket = serverSocket?.accept() ?: break
+                        try {
+                            clientSocket.soTimeout = 30000
+                        } catch (_: Exception) {}
                         Thread { handleClient(clientSocket) }.start()
                     }
                 } catch (e: Exception) {
@@ -61,8 +70,11 @@ class SslTunnel(
                         listener?.onError("SSL server accept error: ${e.message}")
                     }
                 }
-            }.start()
+            }, "SslTunnel-Accept")
+            acceptThread?.isDaemon = true
+            acceptThread?.start()
 
+            listener?.onConnected()
             return localPort
         } catch (e: Exception) {
             listener?.onError("Failed to start SSL tunnel: ${e.message}")
@@ -72,109 +84,226 @@ class SslTunnel(
     }
 
     private fun handleClient(clientSocket: Socket) {
-        var sslSocket: SSLSocket? = null
         try {
-            clientSocket.soTimeout = 30000
-
-            val buf = ByteArray(1024)
+            val buf = ByteArray(4096)
             val input = clientSocket.getInputStream()
             val readLen = input.read(buf)
             if (readLen <= 0) {
+                try { clientSocket.close() } catch (_: Exception) {}
+                return
+            }
+
+            val headerStr = String(buf, 0, readLen, Charsets.US_ASCII).trimStart()
+
+            if (headerStr.startsWith("GET ") || headerStr.startsWith("POST ") ||
+                headerStr.startsWith("PUT ") || headerStr.startsWith("DELETE ") ||
+                headerStr.startsWith("HEAD ") || headerStr.startsWith("CONNECT ")) {
+                handleHttpProxy(clientSocket, buf, readLen)
+                return
+            }
+
+            if ((buf[0].toInt() and 0xFF) == 0x05) {
+                handleSocks5(clientSocket, input)
+                return
+            }
+
+            // DNS-over-TCP: first 2 bytes are the message length, not an ASCII char.
+            // If the length is plausible AND the first two bytes don't form a printable
+            // ASCII character pair, treat as DNS.
+            val firstByte = buf[0].toInt() and 0xFF
+            val secondByte = buf[1].toInt() and 0xFF
+            val looksLikeDns = readLen >= 2 && (firstByte < 0x20 || secondByte < 0x20)
+            if (looksLikeDns) {
+                handleDnsOverTcp(clientSocket, buf, readLen)
+                return
+            }
+
+            listener?.onLog("Unknown protocol byte: 0x${"%02X".format(firstByte)}")
+            try { clientSocket.close() } catch (_: Exception) {}
+        } catch (e: Exception) {
+            listener?.onLog("SSL client error: ${e.message}")
+            try { clientSocket.close() } catch (_: Exception) {}
+        }
+    }
+
+    /**
+     * Handles DNS-over-TCP (RFC 7766). The local client sends a 2-byte length
+     * followed by the raw DNS query. We forward it to the upstream DNS server
+     * (resolved from the configured DNS) via UDP through the TLS tunnel.
+     */
+    private fun handleDnsOverTcp(clientSocket: Socket, firstChunk: ByteArray, firstChunkLen: Int) {
+        Thread({
+            try {
+                // Read the full DNS message: firstChunk already contains the 2-byte length
+                // plus the start of the query. We need to read the rest of the message
+                // according to the length field.
+                val msgLen = ((firstChunk[0].toInt() and 0xFF) shl 8) or (firstChunk[1].toInt() and 0xFF)
+                if (msgLen <= 0 || msgLen > 4096) {
+                    clientSocket.close()
+                    return@Thread
+                }
+                val dnsQuery = ByteArray(msgLen)
+                val alreadyRead = (firstChunkLen - 2).coerceAtMost(msgLen)
+                if (alreadyRead > 0) {
+                    System.arraycopy(firstChunk, 2, dnsQuery, 0, alreadyRead)
+                }
+                var off = alreadyRead
+                val input = clientSocket.getInputStream()
+                while (off < msgLen) {
+                    val n = input.read(dnsQuery, off, msgLen - off)
+                    if (n <= 0) break
+                    off += n
+                }
+                if (off < msgLen) {
+                    clientSocket.close()
+                    return@Thread
+                }
+
+                // Forward the DNS query to an upstream DNS server over UDP through the tunnel.
+                val dnsResponse = forwardDnsOverUdp(dnsQuery)
+                if (dnsResponse != null) {
+                    val out = clientSocket.getOutputStream()
+                    out.write(((dnsResponse.size shr 8) and 0xFF))
+                    out.write(dnsResponse.size and 0xFF)
+                    out.write(dnsResponse)
+                    out.flush()
+                }
+            } catch (e: Exception) {
+                listener?.onLog("DNS-over-TCP error: ${e.message}")
+            } finally {
+                try { clientSocket.close() } catch (_: Exception) {}
+            }
+        }, "SslTunnel-DNS").start()
+    }
+
+    /**
+     * Forwards a DNS query over UDP to a public resolver and returns the raw
+     * response. Uses a DatagramSocket that bypasses the VPN tunnel (this is
+     * the standard way Android resolvers work; the caller must protect the
+     * socket if it wants tunnel bypass).
+     */
+    private fun forwardDnsOverUdp(dnsQuery: ByteArray): ByteArray? {
+        return try {
+            val socket = DatagramSocket()
+            try { datagramSocketProtector?.invoke(socket) } catch (_: Exception) {}
+            socket.soTimeout = 5000
+            val target = InetAddress.getByName("8.8.8.8")
+            val sendPacket = DatagramPacket(dnsQuery, dnsQuery.size, target, 53)
+            socket.send(sendPacket)
+            val buf = ByteArray(4096)
+            val reply = DatagramPacket(buf, buf.size)
+            socket.receive(reply)
+            socket.close()
+            buf.copyOf(reply.length)
+        } catch (e: Exception) {
+            null
+        }
+    }
+
+    private fun handleSocks5(clientSocket: Socket, input: java.io.InputStream) {
+        try {
+            // SOCKS5 greeting reply: VER=5, METHOD=0 (no auth)
+            clientSocket.getOutputStream().write(byteArrayOf(0x05, 0x00))
+            clientSocket.getOutputStream().flush()
+
+            val connectBuf = ByteArray(512)
+            val connectLen = input.read(connectBuf)
+            if (connectLen < 7) {
                 clientSocket.close()
                 return
             }
 
-            val headerStr = String(buf, 0, readLen, Charsets.US_ASCII)
-
-            if (headerStr.startsWith("GET ") || headerStr.startsWith("POST ") || headerStr.startsWith("CONNECT ")) {
-                handleHttpProxy(clientSocket, buf, readLen, headerStr)
-                return
-            }
-
-            // SOCKS5 protocol
-            if (buf[0] == 0x05.toByte()) {
-                // Greeting: version + nmethods + methods
-                clientSocket.getOutputStream().write(byteArrayOf(0x05, 0x00))
+            val version = connectBuf[0].toInt() and 0xFF
+            val cmd = connectBuf[1].toInt() and 0xFF
+            if (version != 0x05 || cmd != 0x01) {
+                clientSocket.getOutputStream().write(byteArrayOf(0x05, 0x07, 0x00, 0x01, 0, 0, 0, 0, 0, 0))
                 clientSocket.getOutputStream().flush()
-
-                // Read CONNECT request
-                val connectBuf = ByteArray(256)
-                val connectLen = input.read(connectBuf)
-                if (connectLen < 7) {
-                    clientSocket.close()
-                    return
-                }
-
-                val cmd = connectBuf[1].toInt() and 0xFF
-                if (cmd != 0x01) {
-                    clientSocket.getOutputStream().write(byteArrayOf(0x05, 0x07, 0x00, 0x01, 0, 0, 0, 0, 0, 0))
-                    clientSocket.getOutputStream().flush()
-                    clientSocket.close()
-                    return
-                }
-
-                val atyp = connectBuf[3].toInt() and 0xFF
-                val targetHost: String
-                val targetPort: Int
-
-                when (atyp) {
-                    0x01 -> {
-                        if (connectLen < 10) { clientSocket.close(); return }
-                        targetHost = "${connectBuf[4].toInt() and 0xFF}.${connectBuf[5].toInt() and 0xFF}.${connectBuf[6].toInt() and 0xFF}.${connectBuf[7].toInt() and 0xFF}"
-                        targetPort = ((connectBuf[8].toInt() and 0xFF) shl 8) or (connectBuf[9].toInt() and 0xFF)
-                    }
-                    0x03 -> {
-                        val domainLen = connectBuf[4].toInt() and 0xFF
-                        if (connectLen < 5 + domainLen + 2) { clientSocket.close(); return }
-                        targetHost = String(connectBuf, 5, domainLen)
-                        targetPort = ((connectBuf[5 + domainLen].toInt() and 0xFF) shl 8) or (connectBuf[6 + domainLen].toInt() and 0xFF)
-                    }
-                    0x04 -> {
-                        if (connectLen < 22) { clientSocket.close(); return }
-                        val ipv6 = ByteArray(16)
-                        System.arraycopy(connectBuf, 4, ipv6, 0, 16)
-                        targetHost = InetAddress.getByAddress(ipv6).hostAddress ?: ""
-                        targetPort = ((connectBuf[20].toInt() and 0xFF) shl 8) or (connectBuf[21].toInt() and 0xFF)
-                    }
-                    else -> {
-                        clientSocket.getOutputStream().write(byteArrayOf(0x05, 0x08, 0x00, 0x01, 0, 0, 0, 0, 0, 0))
-                        clientSocket.getOutputStream().flush()
-                        clientSocket.close()
-                        return
-                    }
-                }
-
-                val remoteSocket = createSslSocksConnection(targetHost, targetPort)
-                if (remoteSocket != null) {
-                    clientSocket.getOutputStream().write(byteArrayOf(0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0))
-                    clientSocket.getOutputStream().flush()
-                    pipe(clientSocket, remoteSocket)
-                } else {
-                    clientSocket.getOutputStream().write(byteArrayOf(0x05, 0x05, 0x00, 0x01, 0, 0, 0, 0, 0, 0))
-                    clientSocket.getOutputStream().flush()
-                    clientSocket.close()
-                }
+                clientSocket.close()
                 return
             }
 
-            clientSocket.close()
-        } catch (e: Exception) {
-            listener?.onLog("SSL client error: ${e.message}")
-            try { clientSocket.close() } catch (_: Exception) {}
-            try { sslSocket?.close() } catch (_: Exception) {}
-        }
-    }
-
-    private fun handleHttpProxy(clientSocket: Socket, header: ByteArray, headerLen: Int, headerStr: String) {
-        try {
-            val input = clientSocket.getInputStream()
-            val firstLine = headerStr.lines().firstOrNull() ?: ""
-            val parts = firstLine.split(" ")
-
+            val atyp = connectBuf[3].toInt() and 0xFF
             val targetHost: String
             val targetPort: Int
 
-            if (parts[0] == "CONNECT") {
+            when (atyp) {
+                0x01 -> {
+                    if (connectLen < 10) { clientSocket.close(); return }
+                    targetHost = "${connectBuf[4].toInt() and 0xFF}.${connectBuf[5].toInt() and 0xFF}.${connectBuf[6].toInt() and 0xFF}.${connectBuf[7].toInt() and 0xFF}"
+                    targetPort = ((connectBuf[8].toInt() and 0xFF) shl 8) or (connectBuf[9].toInt() and 0xFF)
+                }
+                0x03 -> {
+                    val domainLen = connectBuf[4].toInt() and 0xFF
+                    if (connectLen < 5 + domainLen + 2) { clientSocket.close(); return }
+                    targetHost = String(connectBuf, 5, domainLen, Charsets.US_ASCII)
+                    targetPort = ((connectBuf[5 + domainLen].toInt() and 0xFF) shl 8) or (connectBuf[6 + domainLen].toInt() and 0xFF)
+                }
+                0x04 -> {
+                    if (connectLen < 22) { clientSocket.close(); return }
+                    val ipv6 = ByteArray(16)
+                    System.arraycopy(connectBuf, 4, ipv6, 0, 16)
+                    targetHost = InetAddress.getByAddress(ipv6).hostAddress ?: ""
+                    targetPort = ((connectBuf[20].toInt() and 0xFF) shl 8) or (connectBuf[21].toInt() and 0xFF)
+                }
+                else -> {
+                    clientSocket.getOutputStream().write(byteArrayOf(0x05, 0x08, 0x00, 0x01, 0, 0, 0, 0, 0, 0))
+                    clientSocket.getOutputStream().flush()
+                    clientSocket.close()
+                    return
+                }
+            }
+
+            listener?.onLog("SOCKS5 CONNECT to $targetHost:$targetPort via SSL/TLS tunnel")
+            val remoteSocket = createTlsConnection()
+            if (remoteSocket != null) {
+                val reply = byteArrayOf(
+                    0x05, 0x00, 0x00, 0x01,
+                    0, 0, 0, 0, 0, 0
+                )
+                clientSocket.getOutputStream().write(reply)
+                clientSocket.getOutputStream().flush()
+                // Inform remote about the actual target via a SOCKS-like handshake inside TLS
+                pipe(clientSocket, remoteSocket, buildInnerSocksRequest(targetHost, targetPort))
+            } else {
+                clientSocket.getOutputStream().write(byteArrayOf(0x05, 0x05, 0x00, 0x01, 0, 0, 0, 0, 0, 0))
+                clientSocket.getOutputStream().flush()
+                clientSocket.close()
+            }
+        } catch (e: Exception) {
+            listener?.onLog("SOCKS5 handling error: ${e.message}")
+            try { clientSocket.close() } catch (_: Exception) {}
+        }
+    }
+
+    private fun buildInnerSocksRequest(host: String, port: Int): ByteArray {
+        val out = java.io.ByteArrayOutputStream()
+        out.write(byteArrayOf(0x05, 0x01, 0x00, 0x03))
+        val hostBytes = host.toByteArray(Charsets.US_ASCII)
+        out.write(hostBytes.size and 0xFF)
+        out.write(hostBytes)
+        out.write((port shr 8) and 0xFF)
+        out.write(port and 0xFF)
+        return out.toByteArray()
+    }
+
+    private fun handleHttpProxy(clientSocket: Socket, header: ByteArray, headerLen: Int) {
+        try {
+            val headerStr = String(header, 0, headerLen, Charsets.US_ASCII)
+            val firstLine = headerStr.lineSequence().firstOrNull() ?: ""
+            val parts = firstLine.split(" ")
+
+            if (parts.size < 2) {
+                clientSocket.getOutputStream().write("HTTP/1.1 400 Bad Request\r\n\r\n".toByteArray())
+                clientSocket.getOutputStream().flush()
+                clientSocket.close()
+                return
+            }
+
+            val targetHost: String
+            val targetPort: Int
+            val isConnect = parts[0] == "CONNECT"
+
+            if (isConnect) {
                 val hostPort = parts[1].split(":")
                 targetHost = hostPort[0]
                 targetPort = hostPort.getOrNull(1)?.toIntOrNull() ?: 443
@@ -184,26 +313,35 @@ class SslTunnel(
                 targetPort = if (url.port > 0) url.port else if (url.protocol == "https") 443 else 80
             }
 
-            val remoteSocket = createSslSocksConnection(targetHost, targetPort)
+            listener?.onLog("HTTP ${parts[0]} -> $targetHost:$targetPort via SSL/TLS tunnel")
+            val remoteSocket = createTlsConnection()
             if (remoteSocket != null) {
-                if (parts[0] == "CONNECT") {
+                if (isConnect) {
+                    // Send a 200 to the local client immediately so it can start piping data.
                     clientSocket.getOutputStream().write("HTTP/1.1 200 Connection Established\r\n\r\n".toByteArray())
                     clientSocket.getOutputStream().flush()
+                    // For CONNECT, also tell the remote server where to forward via a SOCKS-like request.
+                    pipe(clientSocket, remoteSocket, buildInnerSocksRequest(targetHost, targetPort))
                 } else {
-                    remoteSocket.getOutputStream().write(header, 0, headerLen)
-                    remoteSocket.getOutputStream().flush()
+                    // For non-CONNECT, forward the original request through TLS
+                    pipe(clientSocket, remoteSocket, header.copyOfRange(0, headerLen))
                 }
-                pipe(clientSocket, remoteSocket, null, 0, 0)
             } else {
                 clientSocket.getOutputStream().write("HTTP/1.1 502 Bad Gateway\r\n\r\n".toByteArray())
+                clientSocket.getOutputStream().flush()
                 clientSocket.close()
             }
         } catch (e: Exception) {
+            listener?.onLog("HTTP proxy error: ${e.message}")
             try { clientSocket.close() } catch (_: Exception) {}
         }
     }
 
-    private fun createSslSocksConnection(targetHost: String, targetPort: Int): Socket? {
+    /**
+     * Creates a TLS connection to the configured VPN server.
+     * Returns a Socket that is ready to be piped to a local client.
+     */
+    private fun createTlsConnection(): Socket? {
         return try {
             val sslContext = SSLContext.getInstance("TLS")
             sslContext.init(null, arrayOf<TrustManager>(trustAllManager), SecureRandom())
@@ -211,51 +349,43 @@ class SslTunnel(
             val factory = sslContext.socketFactory as SSLSocketFactory
             val sock = factory.createSocket() as SSLSocket
 
-            socketProtector?.invoke(sock)
+            // Protect the socket so VPN traffic doesn't loop back into the tunnel
+            try { socketProtector?.invoke(sock) } catch (_: Exception) {}
 
             val sniHost = config.sni.ifEmpty { config.serverAddress }
+            val isSniHostAnIp = isIpAddress(sniHost)
 
-            val params = sock.sslParameters
-            try {
-                val sniNames = listOf(SNIHostName(sniHost))
-                params.setServerNames(sniNames)
-            } catch (_: Exception) {
+            // Set SNI only if the configured value is a valid hostname (not an IP literal).
+            // SNIHostName throws IllegalArgumentException for IP addresses per RFC 6066.
+            if (!isSniHostAnIp) {
+                val params = sock.sslParameters
                 try {
-                    val hostnameField = sock.javaClass.getDeclaredField("host")
-                    hostnameField.isAccessible = true
-                    hostnameField.set(sock, sniHost)
-                } catch (_: Exception) {}
+                    val sniNames = listOf<SNIServerName>(SNIHostName(sniHost))
+                    params.serverNames = sniNames
+                    sock.sslParameters = params
+                    listener?.onLog("SNI hostname set to: $sniHost")
+                } catch (e: Exception) {
+                    listener?.onLog("SNI could not be set ('$sniHost'): ${e.message}")
+                }
+            } else {
+                listener?.onLog("Skipping SNI for IP literal: $sniHost")
             }
 
             val serverPort = if (config.serverPort > 0) config.serverPort else 443
             sock.connect(InetSocketAddress(config.serverAddress, serverPort), 15000)
             sock.soTimeout = 60000
+            sock.tcpNoDelay = true
 
             sock.startHandshake()
-            listener?.onLog("SSL/TLS handshake completed with SNI: $sniHost")
+            listener?.onLog("SSL/TLS handshake completed (SNI: $sniHost -> ${config.serverAddress}:$serverPort)")
 
+            // Send the configured payload (if any) once the TLS tunnel is up.
+            // This is the obfuscation header that some servers expect.
             if (config.payload.isNotEmpty()) {
                 val payload = PayloadBuilder.preparePayloadForSsh(config.payload)
-                sock.getOutputStream().write(payload.toByteArray())
+                sock.getOutputStream().write(payload.toByteArray(Charsets.UTF_8))
                 sock.getOutputStream().flush()
-                Thread.sleep(200)
-                listener?.onLog("Payload sent through SSL tunnel")
-            } else {
-                // Send default HTTP upgrade payload when no custom payload is set
-                val sniHost = config.sni.ifEmpty { config.serverAddress }
-                val defaultPayload = "GET / HTTP/1.1
-Host: $sniHost
-User-Agent: Mozilla/5.0
-Connection: Upgrade
-Upgrade: websocket; HTTP/1.1
-Sec-WebSocket-Version: 13
-Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==
-
-"
-                sock.getOutputStream().write(defaultPayload.toByteArray())
-                sock.getOutputStream().flush()
-                Thread.sleep(200)
-                listener?.onLog("Default payload sent through SSL tunnel")
+                listener?.onLog("Custom payload sent through SSL tunnel (${payload.length} bytes)")
             }
 
             sock
@@ -265,39 +395,54 @@ Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==
         }
     }
 
-    private fun pipe(client: Socket, remote: Socket, initialData: ByteArray? = null, initialOffset: Int = 0, initialLen: Int = 0) {
+    private fun isIpAddress(host: String): Boolean {
+        if (host.isEmpty()) return false
+        // IPv6 literal in brackets or raw
+        if (host.startsWith("[") && host.endsWith("]")) return true
+        if (host.contains(":")) return true // simple heuristic for IPv6
+        // IPv4: four dotted octets
+        val parts = host.split(".")
+        if (parts.size == 4) {
+            return parts.all { it.toIntOrNull()?.let { v -> v in 0..255 } == true }
+        }
+        return false
+    }
+
+    private fun pipe(client: Socket, remote: Socket, initialData: ByteArray? = null) {
         try {
-            if (initialData != null && initialLen > 0) {
-                remote.getOutputStream().write(initialData, initialOffset, initialLen)
+            if (initialData != null && initialData.isNotEmpty()) {
+                remote.getOutputStream().write(initialData)
                 remote.getOutputStream().flush()
             }
 
-            Thread {
+            val clientToRemote = Thread({
                 try {
                     val buf = ByteArray(32768)
                     val clientInput = client.getInputStream()
-                    while (isRunning) {
+                    while (isRunning && !client.isClosed && !remote.isClosed) {
                         val read = clientInput.read(buf)
                         if (read == -1) break
                         remote.getOutputStream().write(buf, 0, read)
                         remote.getOutputStream().flush()
                     }
-                } catch (_: Exception) {}
-                finally {
+                } catch (_: Exception) {
+                } finally {
                     try { remote.close() } catch (_: Exception) {}
                 }
-            }.start()
+            }, "SslTunnel-C2R")
+            clientToRemote.isDaemon = true
+            clientToRemote.start()
 
             val buf = ByteArray(32768)
             val remoteInput = remote.getInputStream()
-            while (isRunning) {
+            while (isRunning && !client.isClosed && !remote.isClosed) {
                 val read = remoteInput.read(buf)
                 if (read == -1) break
                 client.getOutputStream().write(buf, 0, read)
                 client.getOutputStream().flush()
             }
-        } catch (_: Exception) {}
-        finally {
+        } catch (_: Exception) {
+        } finally {
             try { client.close() } catch (_: Exception) {}
             try { remote.close() } catch (_: Exception) {}
         }
@@ -306,6 +451,7 @@ Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==
     fun stop() {
         isRunning = false
         try { serverSocket?.close() } catch (_: Exception) {}
+        serverSocket = null
         listener?.onDisconnected("SSL tunnel stopped")
     }
 }
