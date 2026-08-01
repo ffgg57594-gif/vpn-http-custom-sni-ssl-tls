@@ -138,7 +138,8 @@ class SslTunnel(
         Thread({
             try {
                 val msgLen = ((firstChunk[0].toInt() and 0xFF) shl 8) or (firstChunk[1].toInt() and 0xFF)
-                if (msgLen <= 0 || msgLen > 4096) {
+                if (msgLen <= 0 || msgLen > 65535) {
+                    listener?.onLog("DNS-over-TCP: bad query length $msgLen")
                     clientSocket.close()
                     return@Thread
                 }
@@ -181,28 +182,52 @@ class SslTunnel(
      * DoH (it isn't a public DNS endpoint), so we tunnel the raw DNS
      * bytes through the existing TCP-forwarding path.
      *
+     * We try the configured resolver on DNS-over-TCP/53 first. If the
+     * remote returns an HTTP error page (e.g. because port 53 is
+     * blocked), we fall back to DNS-over-TLS on port 853 which is
+     * usually allowed and proven to work with the same inner-SOCKS path
+     * (Google/Cloudflare both support DNS-over-TLS there).
+     *
      * Steps:
      *   1. Open a TLS connection to the configured server (with SNI)
      *   2. Send the configured payload (if any) and an inner-SOCKS
      *      CONNECT request asking the remote to forward bytes to the
-     *      configured DNS resolver (UDP port 53).
+     *      configured DNS resolver.
      *   3. Send the raw DNS query (no length prefix; TCP framing is
      *      enough because the remote just forwards bytes).
      *   4. Read the raw DNS response back and return it.
      */
     private fun forwardDnsOverTls(dnsQuery: ByteArray): ByteArray? {
+        // Resolver candidates in order of preference:
+        //   1. Configured resolver on DoT (port 853) - usually works
+        //   2. Configured resolver on plain DNS (port 53) - may be blocked
+        val resolver = config.dns1.ifEmpty { "8.8.8.8" }
+        val candidates = listOf(
+            resolver to 853,
+            resolver to 53,
+            "1.1.1.1" to 853,
+            "1.0.0.1" to 853
+        )
+        // De-duplicate (same host:port should not be tried twice)
+        val tried = HashSet<Pair<String, Int>>()
+        for ((host, port) in candidates) {
+            if (!tried.add(host to port)) continue
+            listener?.onLog("DNS over TLS via $host:$port")
+            val result = forwardDnsOverTlsOnce(dnsQuery, host, port)
+            if (result != null) return result
+        }
+        listener?.onLog("DNS over TLS: all candidates failed")
+        return null
+    }
+
+    /**
+     * One attempt at forwarding the DNS query to a single host:port.
+     * Returns null on failure (so the caller can try the next candidate).
+     */
+    private fun forwardDnsOverTlsOnce(dnsQuery: ByteArray, host: String, port: Int): ByteArray? {
         var remoteSocket: Socket? = null
         try {
-            remoteSocket = createTlsConnection() ?: run {
-                listener?.onLog("DNS over TLS: failed to open TLS connection")
-                return null
-            }
-
-            // Pick the resolver to use. Prefer the configured DNS servers
-            // so the query reaches the same resolvers the system would
-            // normally use. Fall back to 8.8.8.8 if not set.
-            val resolver = config.dns1.ifEmpty { "8.8.8.8" }
-            listener?.onLog("DNS over TLS via $resolver:53")
+            remoteSocket = createTlsConnection() ?: return null
 
             val out = remoteSocket.getOutputStream()
             val input = remoteSocket.getInputStream()
@@ -211,7 +236,7 @@ class SslTunnel(
             // The remote does not send a SOCKS-style reply back on this
             // inner channel - it just starts forwarding - so we go
             // straight to writing the DNS query after the SOCKS header.
-            val innerSocks = buildInnerSocksRequest(resolver, 53)
+            val innerSocks = buildInnerSocksRequest(host, port)
             out.write(innerSocks)
             out.write(dnsQuery)
             out.flush()
@@ -222,25 +247,42 @@ class SslTunnel(
             // bytes from the resolver, the resolver's response IS a
             // length-prefixed message. We follow the same convention so
             // the caller's length-prefix handling continues to work.
+            //
+            // The maximum DNS message size is 65535 bytes (16-bit length
+            // field), but in practice responses with DNSSEC + many
+            // records can reach 8-16 KB. We allow up to 65535 to be
+            // safe.
+            //
+            // Some VPN servers (or middleboxes) instead respond with an
+            // HTTP error page when DNS is blocked. We detect this by
+            // checking whether the first two bytes form a printable ASCII
+            // sequence that matches "HT" (start of "HTTP/...").
             val lenBuf = ByteArray(2)
-            readFullyOrNull(input, lenBuf) ?: run {
-                listener?.onLog("DNS over TLS: read timed out (no length prefix)")
+            readFullyOrNull(input, lenBuf) ?: return null
+            val firstByte = lenBuf[0].toInt() and 0xFF
+            val secondByte = lenBuf[1].toInt() and 0xFF
+            // Detect HTTP response: 'H' (0x48) followed by 'T' (0x54)
+            if (firstByte == 0x48 && secondByte == 0x54) {
+                // Consume the rest of the HTTP response and discard it
+                val body = readHttpResponseBody(input)
+                val preview = body.take(200).toByteArray().toString(Charsets.UTF_8)
+                    .replace('\n', ' ').replace('\r', ' ').take(120)
+                listener?.onLog(
+                    "DNS over TLS: remote returned HTTP instead of DNS at $host:$port: $preview"
+                )
                 return null
             }
-            val respLen = ((lenBuf[0].toInt() and 0xFF) shl 8) or (lenBuf[1].toInt() and 0xFF)
-            if (respLen <= 0 || respLen > 4096) {
-                listener?.onLog("DNS over TLS: bad response length $respLen")
+            val respLen = (firstByte shl 8) or secondByte
+            if (respLen <= 0 || respLen > 65535) {
+                listener?.onLog("DNS over TLS: bad response length $respLen (hex: 0x${"%04X".format(respLen)}) at $host:$port")
                 return null
             }
 
             val body = ByteArray(respLen)
-            readFullyOrNull(input, body) ?: run {
-                listener?.onLog("DNS over TLS: response body read timed out")
-                return null
-            }
+            readFullyOrNull(input, body) ?: return null
             return body
         } catch (e: Exception) {
-            listener?.onLog("DNS over TLS failed: ${e.message}")
+            listener?.onLog("DNS over TLS attempt to $host:$port failed: ${e.message}")
             return null
         } finally {
             try { remoteSocket?.close() } catch (_: Exception) {}
@@ -270,6 +312,64 @@ class SslTunnel(
         } catch (_: Exception) {
             null
         }
+    }
+
+    /**
+     * Consumes an HTTP response from the input stream and returns the
+     * body bytes. Used to discard HTTP error pages that some VPN
+     * servers return in place of DNS responses.
+     *
+     * The first two bytes (already consumed by the caller) are expected
+     * to be "HT" (the start of "HTTP/1.x"). This function reads until
+     * the end-of-headers marker ("\r\n\r\n") and then either reads the
+     * body by Content-Length (if present) or until EOF / socket timeout.
+     */
+    private fun readHttpResponseBody(input: java.io.InputStream): ByteArray {
+        val headerBuf = StringBuilder()
+        // The first two characters are already consumed, prepend them.
+        headerBuf.append('H').append('T')
+        val body = java.io.ByteArrayOutputStream()
+        var inBody = false
+        var contentLength = -1
+        var chunked = false
+        try {
+            // Read until we see \r\n\r\n
+            while (true) {
+                val b = input.read()
+                if (b == -1) return body.toByteArray()
+                val c = b.toChar()
+                if (!inBody) {
+                    headerBuf.append(c)
+                    if (headerBuf.length >= 4 &&
+                        headerBuf[headerBuf.length - 4] == '\r' &&
+                        headerBuf[headerBuf.length - 3] == '\n' &&
+                        headerBuf[headerBuf.length - 2] == '\r' &&
+                        headerBuf[headerBuf.length - 1] == '\n') {
+                        // End of headers
+                        inBody = true
+                        val headers = headerBuf.toString()
+                        for (line in headers.lineSequence()) {
+                            val lower = line.lowercase()
+                            if (lower.startsWith("content-length:")) {
+                                contentLength = lower.substring(15).trim().toIntOrNull() ?: -1
+                            } else if (lower.startsWith("transfer-encoding:") && lower.contains("chunked")) {
+                                chunked = true
+                            }
+                        }
+                    }
+                } else {
+                    body.write(b)
+                    if (contentLength > 0 && body.size() >= contentLength) break
+                    if (!chunked && contentLength < 0) {
+                        // No content-length and not chunked; read until EOF
+                        // (caller's socket timeout will eventually fire)
+                    }
+                }
+            }
+        } catch (_: Exception) {
+            // ignore
+        }
+        return body.toByteArray()
     }
 
     private fun handleSocks5(clientSocket: Socket, input: java.io.InputStream) {

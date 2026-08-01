@@ -694,7 +694,7 @@ class VpnTunnelService : VpnService() {
             socket = Socket()
             protect(socket)
             socket.connect(InetSocketAddress("127.0.0.1", localProxyPort), 15000)
-            socket.soTimeout = 12000
+            socket.soTimeout = 20000
             socket.tcpNoDelay = true
 
             val out = socket.getOutputStream()
@@ -710,7 +710,10 @@ class VpnTunnelService : VpnService() {
             val lenBuf = ByteArray(2)
             readFully(input, lenBuf)
             val respLen = ((lenBuf[0].toInt() and 0xFF) shl 8) or (lenBuf[1].toInt() and 0xFF)
-            if (respLen <= 0 || respLen > 4096) return null
+            if (respLen <= 0 || respLen > 65535) {
+                addLog(LogEntry(level = LogEntry.Level.DEBUG, message = "DNS over TCP: bad response length $respLen"))
+                return null
+            }
 
             val resp = ByteArray(respLen)
             readFully(input, resp)

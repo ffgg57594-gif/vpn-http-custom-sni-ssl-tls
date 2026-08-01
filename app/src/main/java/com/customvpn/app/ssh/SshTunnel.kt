@@ -119,7 +119,8 @@ class SshTunnel(
         Thread({
             try {
                 val msgLen = ((firstChunk[0].toInt() and 0xFF) shl 8) or (firstChunk[1].toInt() and 0xFF)
-                if (msgLen <= 0 || msgLen > 4096) {
+                if (msgLen <= 0 || msgLen > 65535) {
+                    listener?.onLog("DNS-over-TCP: bad query length $msgLen")
                     clientSocket.close()
                     return@Thread
                 }
