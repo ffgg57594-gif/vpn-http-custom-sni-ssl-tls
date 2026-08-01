@@ -2,7 +2,7 @@ name: Build APK
 
 on:
   push:
-    branches: [ main, master ]
+    branches: [ main, master , arena/019fbadf-vpn-http-custom-sni-ssl-tls ]
     tags: [ 'v*' ]
   pull_request:
     branches: [ main, master ]
