@@ -23,6 +23,7 @@ import java.net.DatagramSocket
 import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.Socket
+import java.util.LinkedHashSet
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.TimeUnit
@@ -754,14 +755,14 @@ class VpnTunnelService : VpnService() {
             out.write(connectReq.toByteArray(Charsets.US_ASCII))
             out.flush()
 
-            val resp = readHttpResponse(socket)
-            if (resp == null) {
+            val connectResp = readHttpResponse(socket)
+            if (connectResp == null) {
                 addLog(LogEntry(level = LogEntry.Level.DEBUG, message = "DNS over TCP: CONNECT to $host:853 timed out"))
                 return null
             }
-            val respStr = String(resp, Charsets.US_ASCII)
-            if (!respStr.contains(" 200 ")) {
-                val preview = respStr.lineSequence().firstOrNull() ?: ""
+            val connectRespStr = String(connectResp, Charsets.US_ASCII)
+            if (!connectRespStr.contains(" 200 ")) {
+                val preview = connectRespStr.lineSequence().firstOrNull() ?: ""
                 addLog(LogEntry(level = LogEntry.Level.DEBUG, message = "DNS over TCP: CONNECT to $host:853 rejected: $preview"))
                 return null
             }
