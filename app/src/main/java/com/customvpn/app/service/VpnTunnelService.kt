@@ -683,12 +683,14 @@ class VpnTunnelService : VpnService() {
     /**
      * Performs a DNS query through the local proxy over TCP (RFC 7766).
      * The local proxy (SslTunnel) opens a TLS connection to the remote
-     * server and forwards the query as DNS-over-HTTPS (DoH, RFC 8484)
-     * to a public resolver (Cloudflare / Google) over the tunnel. The
-     * DNS response is then length-prefixed and sent back to the local
-     * client. This avoids the unreliable direct UDP path while
-     * circumventing any port-based blocking the remote might apply
-     * to DNS-over-TCP (port 53) and DNS-over-TLS (port 853) traffic.
+     * server and forwards the query to a public DNS-over-TLS (DoT,
+     * RFC 7858) endpoint at port 853 using the same inner-SOCKS
+     * mechanism the regular HTTP CONNECT flow uses. The DNS response
+     * is length-prefixed and sent back to the local client. This
+     * avoids the unreliable direct UDP path while side-stepping the
+     * remote's port-53 block (which returns a fake 100 GB Content-
+     * Length page) and the DoH misinterpretation as a WebSocket
+     * upgrade.
      */
     private fun dnsOverTcp(dnsData: ByteArray): ByteArray? {
         var socket: Socket? = null

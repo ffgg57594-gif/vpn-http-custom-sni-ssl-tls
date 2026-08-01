@@ -129,14 +129,12 @@ class SslTunnel(
     /**
      * Handles DNS-over-TCP (RFC 7766) on the local side. The local
      * VpnTunnelService sends a 2-byte length followed by the raw DNS
-     * query. We forward the query to the VPN server's configured
-     * upstream DNS resolver through the TLS tunnel by sending the
-     * same length-prefixed query as the inner bytes (no SOCKS, no
-     * HTTP wrapping) and reading the length-prefixed response. This
-     * mirrors how HTTP Custom resolves DNS: the SNI is the routing
-     * key, the inner bytes are forwarded transparently, the server
-     * uses the SNI to know which user / destination the bytes are
-     * for.
+     * query. We forward the query to a DNS-over-TLS endpoint
+     * (RFC 7858, port 853) through the same TLS tunnel used for the
+     * rest of the app traffic - the same path proven to work for
+     * 8.8.8.8:853 in the regular HTTP CONNECT logs. The remote
+     * opens a TCP connection to the DoT resolver, we send the
+     * length-prefixed query, and read the length-prefixed response.
      */
     private fun handleDnsOverTcp(clientSocket: Socket, firstChunk: ByteArray, firstChunkLen: Int) {
         Thread({
@@ -181,39 +179,56 @@ class SslTunnel(
     }
 
     /**
-     * Forwards a DNS query to the VPN server's upstream DNS resolver
-     * over the same TLS tunnel used for normal traffic.
+     * Forwards a DNS query to a public DNS-over-TLS (DoT, RFC 7858)
+     * endpoint at port 853 through the existing TLS tunnel.
      *
-     * The VPN server (modeled on HTTP Custom) acts as a transparent
-     * TCP forwarder once the TLS handshake is done: it picks the
-     * destination based on the SNI we sent during the handshake and
-     * pipes raw bytes back and forth. The SNI in the app config
-     * (e.g. www.eand.com.eg) is the routing key.
+     * This is the same proven path the regular HTTP CONNECT flow
+     * already uses successfully (we see "Proxy connected for ...
+     * 8.8.8.8:853" in the logs). The remote VPN server opens a TCP
+     * connection to <host>:853 when asked via the inner-SOCKS
+     * handshake, then we send a length-prefixed DNS query (RFC
+     * 7766) and read the length-prefixed response back.
      *
-     * For DNS specifically, we send the DNS query as raw length-
-     * prefixed bytes (RFC 7766) right after the TLS handshake and any
-     * configured payload. The VPN server detects that the first 2
-     * bytes look like a DNS message length, opens a TCP connection
-     * to its configured upstream DNS resolver, and starts piping.
-     * The response is also raw length-prefixed, so we read it the
-     * same way the local client sent it.
-     *
-     * Compared to the previous attempts:
-     *   - Inner-SOCKS approach: the server is a generic HTTPS
-     *     reverse proxy, not a SOCKS5 forwarder, so the SOCKS
-     *     header got interpreted as garbage.
-     *   - DoH (HTTP/1.0 POST /dns-query) sent over the same tunnel:
-     *     the server replied "101 Switching Protocols" because it
-     *     treats the inner HTTP as a WebSocket upgrade request,
-     *     not a real DoH client.
-     *   - DoH through HTTP CONNECT 1.1.1.1:443: same problem, the
-     *     upstream (eand's webserver) doesn't understand CONNECT.
-     *
-     * The only path the server actually understands is: TLS
-     * handshake with a recognizable SNI, payload (if configured),
-     * then raw bytes. So we send raw DNS-over-TCP bytes.
+     * Why DoT (port 853) and not plain DNS (port 53): the remote
+     * is a generic HTTPS reverse proxy that whitelists a few
+     * destinations; port 53 is blocked (fake Content-Length: 100 GB
+     * page) and DoH POSTs are misinterpreted as WebSocket upgrades
+     * ("101 Switching Protocols"). Port 853 with the inner-SOCKS
+     * format is what works - we have direct evidence of port-853
+     * TCP being forwarded normally in the regular HTTP CONNECT
+     * logs.
      */
     private fun forwardDnsOverTls(dnsQuery: ByteArray): ByteArray? {
+        // Build a deduplicated candidate list. We always try DoT/853
+        // first because that's the path the regular HTTP CONNECT
+        // flow proves is forwarded correctly by the remote.
+        val candidates = linkedMapOf<String, Int>()
+        val configured = config.dns1.ifEmpty { "8.8.8.8" }
+        candidates[configured] = 853
+        candidates["1.1.1.1"] = 853
+        candidates["8.8.8.8"] = 853
+        candidates["8.8.4.4"] = 853
+
+        for ((host, port) in candidates) {
+            listener?.onLog("DNS over TLS via $host:$port")
+            val result = forwardDnsOverTlsOnce(dnsQuery, host, port)
+            if (result != null) return result
+        }
+        listener?.onLog("DNS over TLS: all candidates failed")
+        return null
+    }
+
+    /**
+     * One DNS-over-TLS attempt: open a TLS connection to the remote,
+     * ask it to forward bytes to <host>:<port> via inner-SOCKS, send
+     * a length-prefixed DNS query (RFC 7766), read the length-
+     * prefixed DNS response.
+     */
+    private fun forwardDnsOverTlsOnce(
+        dnsQuery: ByteArray,
+        host: String,
+        port: Int
+    ): ByteArray? {
         var remoteSocket: Socket? = null
         try {
             remoteSocket = createTlsConnection() ?: return null
@@ -221,37 +236,43 @@ class SslTunnel(
             val out = remoteSocket.getOutputStream()
             val input = remoteSocket.getInputStream()
 
-            // Send the raw DNS query length-prefixed (RFC 7766). The
-            // server treats the bytes after the TLS handshake as the
-            // inner stream and routes them to the DNS resolver it has
-            // configured for this SNI.
-            val lenPrefix = byteArrayOf(
-                ((dnsQuery.size shr 8) and 0xFF).toByte(),
-                (dnsQuery.size and 0xFF).toByte()
-            )
-            out.write(lenPrefix)
+            // Tell the remote to forward bytes to <host>:<port>.
+            // The remote does not send a SOCKS-style reply back on
+            // this inner channel - it just starts forwarding - so we
+            // go straight to writing the DNS query after the SOCKS
+            // header.
+            val innerSocks = buildInnerSocksRequest(host, port)
+            out.write(innerSocks)
             out.write(dnsQuery)
             out.flush()
             remoteSocket.soTimeout = 10000
 
             // Read the length-prefixed DNS response.
             val lenBuf = ByteArray(2)
-            readFullyOrTimeout(input, lenBuf) ?: return null
-            val respLen = ((lenBuf[0].toInt() and 0xFF) shl 8) or (lenBuf[1].toInt() and 0xFF)
-            if (respLen <= 0 || respLen > 65535) {
-                listener?.onLog("DNS over TLS: bad response length $respLen")
+            readFullyOrTimeout(input, lenBuf) ?: run {
+                listener?.onLog("DNS over TLS: read timed out (no length prefix) at $host:$port")
                 return null
             }
+            val respLen = ((lenBuf[0].toInt() and 0xFF) shl 8) or (lenBuf[1].toInt() and 0xFF)
+            if (respLen <= 0 || respLen > 65535) {
+                listener?.onLog("DNS over TLS: bad response length $respLen at $host:$port")
+                return null
+            }
+
             val body = ByteArray(respLen)
-            readFullyOrTimeout(input, body) ?: return null
+            readFullyOrTimeout(input, body) ?: run {
+                listener?.onLog("DNS over TLS: response body read timed out at $host:$port")
+                return null
+            }
             return body
         } catch (e: Exception) {
-            listener?.onLog("DNS over TLS failed: ${e.message}")
+            listener?.onLog("DNS over TLS attempt to $host:$port failed: ${e.message}")
             return null
         } finally {
             try { remoteSocket?.close() } catch (_: Exception) {}
         }
     }
+
 
     /**
      * Reads exactly buf.size bytes from input, honouring the
