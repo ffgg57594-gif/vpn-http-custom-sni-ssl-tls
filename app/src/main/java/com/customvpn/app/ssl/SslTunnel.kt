@@ -129,18 +129,10 @@ class SslTunnel(
     /**
      * Handles DNS-over-TCP (RFC 7766). The local client sends a 2-byte length
      * followed by the raw DNS query. We forward the query through the TLS
-     * tunnel to a DoH (DNS-over-HTTPS) endpoint using an HTTP/1.1 POST
-     * request, which most modern VPN servers understand and forward to
-     * an upstream resolver.
-     *
-     * Format: POST /dns-query HTTP/1.1\r\n
-     *         Host: dns.google\r\n
-     *         Content-Type: application/dns-message\r\n
-     *         Content-Length: N\r\n
-     *         \r\n
-     *         <dns-query-bytes>
-     *
-     * Response: 200 OK\r\n + Content-Type + Content-Length + body
+     * tunnel to the configured DNS resolver (TCP/53) using the same
+     * inner-SOCKS mechanism used by the regular HTTP CONNECT path, so the
+     * remote VPN server just opens a TCP connection to the resolver and
+     * forwards the DNS bytes back and forth.
      */
     private fun handleDnsOverTcp(clientSocket: Socket, firstChunk: ByteArray, firstChunkLen: Int) {
         Thread({
@@ -184,86 +176,98 @@ class SslTunnel(
     }
 
     /**
-     * Sends a DNS query through a fresh TLS connection to the remote server
-     * using HTTP/1.1 POST with content-type application/dns-message. The
-     * remote server is expected to act as a DoH proxy and forward the query
-     * upstream.
+     * Forwards a DNS query through the same TLS+inner-SOCKS mechanism used
+     * by the regular HTTP CONNECT path. The remote server doesn't speak
+     * DoH (it isn't a public DNS endpoint), so we tunnel the raw DNS
+     * bytes through the existing TCP-forwarding path.
+     *
+     * Steps:
+     *   1. Open a TLS connection to the configured server (with SNI)
+     *   2. Send the configured payload (if any) and an inner-SOCKS
+     *      CONNECT request asking the remote to forward bytes to the
+     *      configured DNS resolver (UDP port 53).
+     *   3. Send the raw DNS query (no length prefix; TCP framing is
+     *      enough because the remote just forwards bytes).
+     *   4. Read the raw DNS response back and return it.
      */
     private fun forwardDnsOverTls(dnsQuery: ByteArray): ByteArray? {
-        return try {
-            val sslContext = SSLContext.getInstance("TLS")
-            sslContext.init(null, arrayOf<TrustManager>(trustAllManager), SecureRandom())
-            val factory = sslContext.socketFactory as SSLSocketFactory
-            val sock = factory.createSocket() as SSLSocket
-            try { socketProtector?.invoke(sock) } catch (_: Exception) {}
-
-            val sniHost = config.sni.ifEmpty { config.serverAddress }
-            if (!isIpAddress(sniHost)) {
-                try {
-                    val params = sock.sslParameters
-                    params.serverNames = listOf<SNIServerName>(SNIHostName(sniHost))
-                    sock.sslParameters = params
-                } catch (_: Exception) {}
+        var remoteSocket: Socket? = null
+        try {
+            remoteSocket = createTlsConnection() ?: run {
+                listener?.onLog("DNS over TLS: failed to open TLS connection")
+                return null
             }
 
-            val serverPort = if (config.serverPort > 0) config.serverPort else 443
-            sock.connect(InetSocketAddress(config.serverAddress, serverPort), 15000)
-            sock.soTimeout = 10000
-            sock.tcpNoDelay = true
-            sock.startHandshake()
+            // Pick the resolver to use. Prefer the configured DNS servers
+            // so the query reaches the same resolvers the system would
+            // normally use. Fall back to 8.8.8.8 if not set.
+            val resolver = config.dns1.ifEmpty { "8.8.8.8" }
+            listener?.onLog("DNS over TLS via $resolver:53")
 
-            if (config.payload.isNotEmpty()) {
-                val payload = PayloadBuilder.preparePayloadForSsh(config.payload)
-                sock.getOutputStream().write(payload.toByteArray(Charsets.UTF_8))
-                sock.getOutputStream().flush()
-            }
+            val out = remoteSocket.getOutputStream()
+            val input = remoteSocket.getInputStream()
 
-            // Send DoH POST request
-            val dohHost = sniHost.ifEmpty { config.serverAddress }
-            val httpReq = buildString {
-                append("POST /dns-query HTTP/1.1\r\n")
-                append("Host: $dohHost\r\n")
-                append("Content-Type: application/dns-message\r\n")
-                append("Content-Length: ${dnsQuery.size}\r\n")
-                append("Connection: close\r\n")
-                append("\r\n")
-            }
-            val out = sock.getOutputStream()
-            out.write(httpReq.toByteArray(Charsets.US_ASCII))
+            // Tell the remote where to forward these bytes (inner SOCKS).
+            // The remote does not send a SOCKS-style reply back on this
+            // inner channel - it just starts forwarding - so we go
+            // straight to writing the DNS query after the SOCKS header.
+            val innerSocks = buildInnerSocksRequest(resolver, 53)
+            out.write(innerSocks)
             out.write(dnsQuery)
             out.flush()
+            remoteSocket.soTimeout = 10000
 
-            // Parse HTTP response
-            val input = sock.getInputStream()
-            val headerBuf = StringBuilder()
-            while (true) {
-                val b = input.read()
-                if (b == -1) {
-                    sock.close()
-                    return null
-                }
-                if (b == '\n'.code) {
-                    val line = headerBuf.toString().trimEnd('\r')
-                    if (line.isEmpty()) break
-                    headerBuf.clear()
-                    // We could check status line here; for now just consume headers.
-                } else {
-                    headerBuf.append(b.toChar())
-                }
+            // Read the raw DNS response. DNS over TCP replies with a
+            // 2-byte length prefix, but if the remote is just forwarding
+            // bytes from the resolver, the resolver's response IS a
+            // length-prefixed message. We follow the same convention so
+            // the caller's length-prefix handling continues to work.
+            val lenBuf = ByteArray(2)
+            readFullyOrNull(input, lenBuf) ?: run {
+                listener?.onLog("DNS over TLS: read timed out (no length prefix)")
+                return null
+            }
+            val respLen = ((lenBuf[0].toInt() and 0xFF) shl 8) or (lenBuf[1].toInt() and 0xFF)
+            if (respLen <= 0 || respLen > 4096) {
+                listener?.onLog("DNS over TLS: bad response length $respLen")
+                return null
             }
 
-            // Read body by reading until EOF (we sent Connection: close)
-            val body = java.io.ByteArrayOutputStream()
-            val buf = ByteArray(4096)
-            while (true) {
-                val n = input.read(buf)
-                if (n == -1) break
-                body.write(buf, 0, n)
+            val body = ByteArray(respLen)
+            readFullyOrNull(input, body) ?: run {
+                listener?.onLog("DNS over TLS: response body read timed out")
+                return null
             }
-            sock.close()
-            body.toByteArray()
+            return body
         } catch (e: Exception) {
             listener?.onLog("DNS over TLS failed: ${e.message}")
+            return null
+        } finally {
+            try { remoteSocket?.close() } catch (_: Exception) {}
+        }
+    }
+
+    /**
+     * Reads exactly buf.size bytes from input. Returns null on timeout,
+     * premature EOF, or any IO error.
+     *
+     * The caller is expected to have set the underlying socket's
+     * soTimeout (we set `remoteSocket.soTimeout = 10000` inside
+     * `forwardDnsOverTls` before calling this), so a single read() call
+     * will throw SocketTimeoutException on expiry.
+     */
+    private fun readFullyOrNull(input: java.io.InputStream, buf: ByteArray): ByteArray? {
+        return try {
+            var off = 0
+            while (off < buf.size) {
+                val n = input.read(buf, off, buf.size - off)
+                if (n <= 0) return null
+                off += n
+            }
+            buf
+        } catch (_: java.net.SocketTimeoutException) {
+            null
+        } catch (_: Exception) {
             null
         }
     }

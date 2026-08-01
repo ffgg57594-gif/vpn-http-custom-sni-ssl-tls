@@ -682,8 +682,9 @@ class VpnTunnelService : VpnService() {
 
     /**
      * Performs a DNS query through the local proxy over TCP (RFC 7766).
-     * The local proxy (SslTunnel/SshTunnel) opens a TLS connection to the
-     * remote server and forwards the query as a DoH POST. This keeps the
+     * The local proxy (SslTunnel) opens a TLS connection to the remote
+     * server and tunnels the raw DNS bytes via the same inner-SOCKS
+     * mechanism used for regular HTTP CONNECT traffic. This keeps the
      * DNS query inside the VPN tunnel and avoids the unreliable direct
      * UDP path.
      */
@@ -739,7 +740,7 @@ class VpnTunnelService : VpnService() {
             try {
                 val socket = DatagramSocket()
                 protect(socket)
-                socket.soTimeout = 5000
+                socket.soTimeout = 15000
 
                 val data = packet.copyOfRange(dataOffset, dataOffset + dataLen)
                 val dp = DatagramPacket(data, data.size, dstAddr, dstPort)
