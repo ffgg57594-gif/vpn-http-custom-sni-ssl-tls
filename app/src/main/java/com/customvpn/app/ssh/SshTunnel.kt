@@ -158,6 +158,8 @@ class SshTunnel(
 
     private fun forwardDnsOverUdp(dnsQuery: ByteArray): ByteArray? {
         return try {
+            // SshTunnel doesn't have TLS so DNS-over-TLS is not possible.
+            // Fall back to direct UDP query to a public resolver.
             val socket = DatagramSocket()
             try { datagramSocketProtector?.invoke(socket) } catch (_: Exception) {}
             socket.soTimeout = 5000

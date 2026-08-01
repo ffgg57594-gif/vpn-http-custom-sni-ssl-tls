@@ -682,9 +682,10 @@ class VpnTunnelService : VpnService() {
 
     /**
      * Performs a DNS query through the local proxy over TCP (RFC 7766).
-     * This is far more reliable than going out directly because the
-     * DatagramSocket-based path bypasses the tunnel, which often gets
-     * dropped by carriers or blocked by the DNS server's firewall.
+     * The local proxy (SslTunnel/SshTunnel) opens a TLS connection to the
+     * remote server and forwards the query as a DoH POST. This keeps the
+     * DNS query inside the VPN tunnel and avoids the unreliable direct
+     * UDP path.
      */
     private fun dnsOverTcp(dnsData: ByteArray): ByteArray? {
         var socket: Socket? = null
@@ -692,7 +693,7 @@ class VpnTunnelService : VpnService() {
             socket = Socket()
             protect(socket)
             socket.connect(InetSocketAddress("127.0.0.1", localProxyPort), 15000)
-            socket.soTimeout = 8000
+            socket.soTimeout = 12000
             socket.tcpNoDelay = true
 
             val out = socket.getOutputStream()

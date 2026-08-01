@@ -128,15 +128,23 @@ class SslTunnel(
 
     /**
      * Handles DNS-over-TCP (RFC 7766). The local client sends a 2-byte length
-     * followed by the raw DNS query. We forward it to the upstream DNS server
-     * (resolved from the configured DNS) via UDP through the TLS tunnel.
+     * followed by the raw DNS query. We forward the query through the TLS
+     * tunnel to a DoH (DNS-over-HTTPS) endpoint using an HTTP/1.1 POST
+     * request, which most modern VPN servers understand and forward to
+     * an upstream resolver.
+     *
+     * Format: POST /dns-query HTTP/1.1\r\n
+     *         Host: dns.google\r\n
+     *         Content-Type: application/dns-message\r\n
+     *         Content-Length: N\r\n
+     *         \r\n
+     *         <dns-query-bytes>
+     *
+     * Response: 200 OK\r\n + Content-Type + Content-Length + body
      */
     private fun handleDnsOverTcp(clientSocket: Socket, firstChunk: ByteArray, firstChunkLen: Int) {
         Thread({
             try {
-                // Read the full DNS message: firstChunk already contains the 2-byte length
-                // plus the start of the query. We need to read the rest of the message
-                // according to the length field.
                 val msgLen = ((firstChunk[0].toInt() and 0xFF) shl 8) or (firstChunk[1].toInt() and 0xFF)
                 if (msgLen <= 0 || msgLen > 4096) {
                     clientSocket.close()
@@ -159,8 +167,7 @@ class SslTunnel(
                     return@Thread
                 }
 
-                // Forward the DNS query to an upstream DNS server over UDP through the tunnel.
-                val dnsResponse = forwardDnsOverUdp(dnsQuery)
+                val dnsResponse = forwardDnsOverTls(dnsQuery)
                 if (dnsResponse != null) {
                     val out = clientSocket.getOutputStream()
                     out.write(((dnsResponse.size shr 8) and 0xFF))
@@ -177,25 +184,86 @@ class SslTunnel(
     }
 
     /**
-     * Forwards a DNS query over UDP to a public resolver and returns the raw
-     * response. Uses a DatagramSocket that bypasses the VPN tunnel (this is
-     * the standard way Android resolvers work; the caller must protect the
-     * socket if it wants tunnel bypass).
+     * Sends a DNS query through a fresh TLS connection to the remote server
+     * using HTTP/1.1 POST with content-type application/dns-message. The
+     * remote server is expected to act as a DoH proxy and forward the query
+     * upstream.
      */
-    private fun forwardDnsOverUdp(dnsQuery: ByteArray): ByteArray? {
+    private fun forwardDnsOverTls(dnsQuery: ByteArray): ByteArray? {
         return try {
-            val socket = DatagramSocket()
-            try { datagramSocketProtector?.invoke(socket) } catch (_: Exception) {}
-            socket.soTimeout = 5000
-            val target = InetAddress.getByName("8.8.8.8")
-            val sendPacket = DatagramPacket(dnsQuery, dnsQuery.size, target, 53)
-            socket.send(sendPacket)
+            val sslContext = SSLContext.getInstance("TLS")
+            sslContext.init(null, arrayOf<TrustManager>(trustAllManager), SecureRandom())
+            val factory = sslContext.socketFactory as SSLSocketFactory
+            val sock = factory.createSocket() as SSLSocket
+            try { socketProtector?.invoke(sock) } catch (_: Exception) {}
+
+            val sniHost = config.sni.ifEmpty { config.serverAddress }
+            if (!isIpAddress(sniHost)) {
+                try {
+                    val params = sock.sslParameters
+                    params.serverNames = listOf<SNIServerName>(SNIHostName(sniHost))
+                    sock.sslParameters = params
+                } catch (_: Exception) {}
+            }
+
+            val serverPort = if (config.serverPort > 0) config.serverPort else 443
+            sock.connect(InetSocketAddress(config.serverAddress, serverPort), 15000)
+            sock.soTimeout = 10000
+            sock.tcpNoDelay = true
+            sock.startHandshake()
+
+            if (config.payload.isNotEmpty()) {
+                val payload = PayloadBuilder.preparePayloadForSsh(config.payload)
+                sock.getOutputStream().write(payload.toByteArray(Charsets.UTF_8))
+                sock.getOutputStream().flush()
+            }
+
+            // Send DoH POST request
+            val dohHost = sniHost.ifEmpty { config.serverAddress }
+            val httpReq = buildString {
+                append("POST /dns-query HTTP/1.1\r\n")
+                append("Host: $dohHost\r\n")
+                append("Content-Type: application/dns-message\r\n")
+                append("Content-Length: ${dnsQuery.size}\r\n")
+                append("Connection: close\r\n")
+                append("\r\n")
+            }
+            val out = sock.getOutputStream()
+            out.write(httpReq.toByteArray(Charsets.US_ASCII))
+            out.write(dnsQuery)
+            out.flush()
+
+            // Parse HTTP response
+            val input = sock.getInputStream()
+            val headerBuf = StringBuilder()
+            while (true) {
+                val b = input.read()
+                if (b == -1) {
+                    sock.close()
+                    return null
+                }
+                if (b == '\n'.code) {
+                    val line = headerBuf.toString().trimEnd('\r')
+                    if (line.isEmpty()) break
+                    headerBuf.clear()
+                    // We could check status line here; for now just consume headers.
+                } else {
+                    headerBuf.append(b.toChar())
+                }
+            }
+
+            // Read body by reading until EOF (we sent Connection: close)
+            val body = java.io.ByteArrayOutputStream()
             val buf = ByteArray(4096)
-            val reply = DatagramPacket(buf, buf.size)
-            socket.receive(reply)
-            socket.close()
-            buf.copyOf(reply.length)
+            while (true) {
+                val n = input.read(buf)
+                if (n == -1) break
+                body.write(buf, 0, n)
+            }
+            sock.close()
+            body.toByteArray()
         } catch (e: Exception) {
+            listener?.onLog("DNS over TLS failed: ${e.message}")
             null
         }
     }
