@@ -127,12 +127,14 @@ class SslTunnel(
     }
 
     /**
-     * Handles DNS-over-TCP (RFC 7766). The local client sends a 2-byte length
-     * followed by the raw DNS query. We forward the query through the TLS
-     * tunnel to the configured DNS resolver (TCP/53) using the same
-     * inner-SOCKS mechanism used by the regular HTTP CONNECT path, so the
-     * remote VPN server just opens a TCP connection to the resolver and
-     * forwards the DNS bytes back and forth.
+     * Handles DNS-over-TCP (RFC 7766) on the local side. The local
+     * VpnTunnelService sends a 2-byte length followed by the raw DNS
+     * query. We forward the query to a public DNS-over-HTTPS (DoH,
+     * RFC 8484) endpoint through the TLS tunnel and pipe the response
+     * back the same way. This is the same approach HTTP Custom uses
+     * for DNS resolution: it works even when the remote VPN server
+     * blocks plain DNS (port 53) and DNS-over-TLS (port 853), because
+     * port 443 is always forwarded normally.
      */
     private fun handleDnsOverTcp(clientSocket: Socket, firstChunk: ByteArray, firstChunkLen: Int) {
         Thread({
@@ -177,54 +179,58 @@ class SslTunnel(
     }
 
     /**
-     * Forwards a DNS query through the same TLS+inner-SOCKS mechanism used
-     * by the regular HTTP CONNECT path. The remote server doesn't speak
-     * DoH (it isn't a public DNS endpoint), so we tunnel the raw DNS
-     * bytes through the existing TCP-forwarding path.
+     * Forwards a DNS query to a public DNS-over-HTTPS (DoH, RFC 8484)
+     * endpoint through the existing TLS tunnel.
      *
-     * We try the configured resolver on DNS-over-TCP/53 first. If the
-     * remote returns an HTTP error page (e.g. because port 53 is
-     * blocked), we fall back to DNS-over-TLS on port 853 which is
-     * usually allowed and proven to work with the same inner-SOCKS path
-     * (Google/Cloudflare both support DNS-over-TLS there).
+     * Why DoH and not raw DNS-over-TCP: the remote VPN server is a
+     * generic HTTPS reverse proxy that only forwards TCP traffic
+     * whitelisted by port. Plain DNS (port 53) and DNS-over-TLS
+     * (port 853) are both blocked - the server replies with a fake
+     * HTTP/1.1 response (we saw a Content-Length of 100 GB) to stall
+     * the client. Port 443, on the other hand, is forwarded normally,
+     * so we can ride on the proven HTTP-CONNECT path: open a tunnel to
+     * 1.1.1.1:443 (Cloudflare) or 8.8.8.8:443 (Google), send a DoH
+     * POST /dns-query request, read the DNS response from the body.
+     *
+     * This is the same approach HTTP Custom uses for DNS resolution.
      *
      * Steps:
      *   1. Open a TLS connection to the configured server (with SNI)
-     *   2. Send the configured payload (if any) and an inner-SOCKS
-     *      CONNECT request asking the remote to forward bytes to the
-     *      configured DNS resolver.
-     *   3. Send the raw DNS query (no length prefix; TCP framing is
-     *      enough because the remote just forwards bytes).
-     *   4. Read the raw DNS response back and return it.
+     *   2. Send an inner-SOCKS CONNECT request to the DoH endpoint on
+     *      port 443 (the only DNS-related port the remote forwards).
+     *   3. Send an HTTP/1.1 POST /dns-query with the raw DNS query
+     *      bytes as the body and Content-Type: application/dns-message.
+     *   4. Read the HTTP response, strip headers, return the body.
      */
     private fun forwardDnsOverTls(dnsQuery: ByteArray): ByteArray? {
-        // Resolver candidates in order of preference:
-        //   1. Configured resolver on DoT (port 853) - usually works
-        //   2. Configured resolver on plain DNS (port 53) - may be blocked
-        val resolver = config.dns1.ifEmpty { "8.8.8.8" }
+        // DoH endpoints, in order of preference. We use the IP rather
+        // than the hostname so the inner-SOCKS ATYP=0x01 (IPv4) format
+        // is enough - we don't need a resolver to look up the endpoint.
         val candidates = listOf(
-            resolver to 853,
-            resolver to 53,
-            "1.1.1.1" to 853,
-            "1.0.0.1" to 853
+            "1.1.1.1" to "cloudflare-dns.com",
+            "1.0.0.1" to "cloudflare-dns.com",
+            "8.8.8.8" to "dns.google",
+            "8.8.4.4" to "dns.google"
         )
-        // De-duplicate (same host:port should not be tried twice)
-        val tried = HashSet<Pair<String, Int>>()
-        for ((host, port) in candidates) {
-            if (!tried.add(host to port)) continue
-            listener?.onLog("DNS over TLS via $host:$port")
-            val result = forwardDnsOverTlsOnce(dnsQuery, host, port)
+        for ((host, dohHost) in candidates) {
+            listener?.onLog("DNS over HTTPS via $host ($dohHost)")
+            val result = forwardDnsOverHttpsOnce(dnsQuery, host, dohHost)
             if (result != null) return result
         }
-        listener?.onLog("DNS over TLS: all candidates failed")
+        listener?.onLog("DNS over HTTPS: all candidates failed")
         return null
     }
 
     /**
-     * One attempt at forwarding the DNS query to a single host:port.
-     * Returns null on failure (so the caller can try the next candidate).
+     * One DoH attempt: open a TLS tunnel to the remote VPN server, ask
+     * it to forward to <host>:443, send an HTTP POST /dns-query, read
+     * the response body.
      */
-    private fun forwardDnsOverTlsOnce(dnsQuery: ByteArray, host: String, port: Int): ByteArray? {
+    private fun forwardDnsOverHttpsOnce(
+        dnsQuery: ByteArray,
+        host: String,
+        dohHost: String
+    ): ByteArray? {
         var remoteSocket: Socket? = null
         try {
             remoteSocket = createTlsConnection() ?: return null
@@ -232,57 +238,34 @@ class SslTunnel(
             val out = remoteSocket.getOutputStream()
             val input = remoteSocket.getInputStream()
 
-            // Tell the remote where to forward these bytes (inner SOCKS).
-            // The remote does not send a SOCKS-style reply back on this
-            // inner channel - it just starts forwarding - so we go
-            // straight to writing the DNS query after the SOCKS header.
-            val innerSocks = buildInnerSocksRequest(host, port)
+            // Ask the remote to forward bytes to <host>:443
+            val innerSocks = buildInnerSocksRequest(host, 443)
             out.write(innerSocks)
+            out.flush()
+
+            // Send DoH POST request. Use HTTP/1.0 + Connection: close so
+            // the DoH server closes the connection after the response
+            // (much easier to parse than reading a Content-Length).
+            val httpReq = buildString {
+                append("POST /dns-query HTTP/1.0\r\n")
+                append("Host: $dohHost\r\n")
+                append("Content-Type: application/dns-message\r\n")
+                append("Content-Length: ${dnsQuery.size}\r\n")
+                append("Accept: application/dns-message\r\n")
+                append("User-Agent: CustomVPN/1.0\r\n")
+                append("Connection: close\r\n")
+                append("\r\n")
+            }
+            out.write(httpReq.toByteArray(Charsets.US_ASCII))
             out.write(dnsQuery)
             out.flush()
             remoteSocket.soTimeout = 10000
 
-            // Read the raw DNS response. DNS over TCP replies with a
-            // 2-byte length prefix, but if the remote is just forwarding
-            // bytes from the resolver, the resolver's response IS a
-            // length-prefixed message. We follow the same convention so
-            // the caller's length-prefix handling continues to work.
-            //
-            // The maximum DNS message size is 65535 bytes (16-bit length
-            // field), but in practice responses with DNSSEC + many
-            // records can reach 8-16 KB. We allow up to 65535 to be
-            // safe.
-            //
-            // Some VPN servers (or middleboxes) instead respond with an
-            // HTTP error page when DNS is blocked. We detect this by
-            // checking whether the first two bytes form a printable ASCII
-            // sequence that matches "HT" (start of "HTTP/...").
-            val lenBuf = ByteArray(2)
-            readFullyOrNull(input, lenBuf) ?: return null
-            val firstByte = lenBuf[0].toInt() and 0xFF
-            val secondByte = lenBuf[1].toInt() and 0xFF
-            // Detect HTTP response: 'H' (0x48) followed by 'T' (0x54)
-            if (firstByte == 0x48 && secondByte == 0x54) {
-                // Consume the rest of the HTTP response and discard it
-                val body = readHttpResponseBody(input)
-                val preview = body.take(200).toByteArray().toString(Charsets.UTF_8)
-                    .replace('\n', ' ').replace('\r', ' ').take(120)
-                listener?.onLog(
-                    "DNS over TLS: remote returned HTTP instead of DNS at $host:$port: $preview"
-                )
-                return null
-            }
-            val respLen = (firstByte shl 8) or secondByte
-            if (respLen <= 0 || respLen > 65535) {
-                listener?.onLog("DNS over TLS: bad response length $respLen (hex: 0x${"%04X".format(respLen)}) at $host:$port")
-                return null
-            }
-
-            val body = ByteArray(respLen)
-            readFullyOrNull(input, body) ?: return null
-            return body
+            // Read the full HTTP response (headers + body) until EOF
+            // (the DoH server will close the connection when done).
+            return readDohResponse(input)
         } catch (e: Exception) {
-            listener?.onLog("DNS over TLS attempt to $host:$port failed: ${e.message}")
+            listener?.onLog("DNS over HTTPS attempt to $host failed: ${e.message}")
             return null
         } finally {
             try { remoteSocket?.close() } catch (_: Exception) {}
@@ -290,86 +273,80 @@ class SslTunnel(
     }
 
     /**
-     * Reads exactly buf.size bytes from input. Returns null on timeout,
-     * premature EOF, or any IO error.
-     *
-     * The caller is expected to have set the underlying socket's
-     * soTimeout (we set `remoteSocket.soTimeout = 10000` inside
-     * `forwardDnsOverTls` before calling this), so a single read() call
-     * will throw SocketTimeoutException on expiry.
+     * Reads the full HTTP response from the input stream and returns
+     * the body bytes. The DoH server is expected to close the
+     * connection after sending the response (we sent Connection:
+     * close), so we just read until EOF.
      */
-    private fun readFullyOrNull(input: java.io.InputStream, buf: ByteArray): ByteArray? {
+    private fun readDohResponse(input: java.io.InputStream): ByteArray? {
         return try {
-            var off = 0
-            while (off < buf.size) {
-                val n = input.read(buf, off, buf.size - off)
-                if (n <= 0) return null
-                off += n
+            // Read all bytes until EOF. We have to be careful about the
+            // size cap to avoid OOM if the server sends garbage.
+            val maxBytes = 65535 + 4096  // 64 KB response + 4 KB headers
+            val all = java.io.ByteArrayOutputStream()
+            val buf = ByteArray(4096)
+            while (all.size() < maxBytes) {
+                val n = try {
+                    input.read(buf)
+                } catch (_: java.net.SocketTimeoutException) {
+                    -1
+                }
+                if (n <= 0) break
+                all.write(buf, 0, n)
             }
-            buf
-        } catch (_: java.net.SocketTimeoutException) {
-            null
-        } catch (_: Exception) {
+            val raw = all.toByteArray()
+            // Find end of headers
+            val headerEnd = indexOfCrlfCrlf(raw)
+            if (headerEnd < 0) {
+                listener?.onLog("DNS over HTTPS: no header terminator in response")
+                return null
+            }
+            val headers = String(raw, 0, headerEnd, Charsets.US_ASCII)
+            // Look at the status line to ensure success
+            val statusLine = headers.lineSequence().firstOrNull() ?: ""
+            if (!statusLine.contains(" 200 ") && !statusLine.contains(" 201 ")) {
+                val preview = headers.lineSequence().take(3).joinToString(" | ")
+                listener?.onLog("DNS over HTTPS: non-200 status: $preview")
+                // Cloudflare/Google may return 413 for huge responses,
+                // or 400 for malformed input. Fall through to the next
+                // candidate by returning null.
+                return null
+            }
+            // Locate the Content-Length header so we can trim the body
+            // to exactly the right number of bytes (in case the server
+            // appends extra garbage after the body).
+            var contentLength = -1
+            for (line in headers.lineSequence()) {
+                val lower = line.lowercase()
+                if (lower.startsWith("content-length:")) {
+                    contentLength = lower.substring(15).trim().toIntOrNull() ?: -1
+                }
+            }
+            val bodyStart = headerEnd + 4
+            if (contentLength in 0..(raw.size - bodyStart)) {
+                return raw.copyOfRange(bodyStart, bodyStart + contentLength)
+            }
+            // No (or bogus) Content-Length; return everything after the
+            // headers. Since the server closed the connection, this
+            // should be the entire body.
+            return raw.copyOfRange(bodyStart, raw.size)
+        } catch (e: Exception) {
+            listener?.onLog("DNS over HTTPS: error reading response: ${e.message}")
             null
         }
     }
 
-    /**
-     * Consumes an HTTP response from the input stream and returns the
-     * body bytes. Used to discard HTTP error pages that some VPN
-     * servers return in place of DNS responses.
-     *
-     * The first two bytes (already consumed by the caller) are expected
-     * to be "HT" (the start of "HTTP/1.x"). This function reads until
-     * the end-of-headers marker ("\r\n\r\n") and then either reads the
-     * body by Content-Length (if present) or until EOF / socket timeout.
-     */
-    private fun readHttpResponseBody(input: java.io.InputStream): ByteArray {
-        val headerBuf = StringBuilder()
-        // The first two characters are already consumed, prepend them.
-        headerBuf.append('H').append('T')
-        val body = java.io.ByteArrayOutputStream()
-        var inBody = false
-        var contentLength = -1
-        var chunked = false
-        try {
-            // Read until we see \r\n\r\n
-            while (true) {
-                val b = input.read()
-                if (b == -1) return body.toByteArray()
-                val c = b.toChar()
-                if (!inBody) {
-                    headerBuf.append(c)
-                    if (headerBuf.length >= 4 &&
-                        headerBuf[headerBuf.length - 4] == '\r' &&
-                        headerBuf[headerBuf.length - 3] == '\n' &&
-                        headerBuf[headerBuf.length - 2] == '\r' &&
-                        headerBuf[headerBuf.length - 1] == '\n') {
-                        // End of headers
-                        inBody = true
-                        val headers = headerBuf.toString()
-                        for (line in headers.lineSequence()) {
-                            val lower = line.lowercase()
-                            if (lower.startsWith("content-length:")) {
-                                contentLength = lower.substring(15).trim().toIntOrNull() ?: -1
-                            } else if (lower.startsWith("transfer-encoding:") && lower.contains("chunked")) {
-                                chunked = true
-                            }
-                        }
-                    }
-                } else {
-                    body.write(b)
-                    if (contentLength > 0 && body.size() >= contentLength) break
-                    if (!chunked && contentLength < 0) {
-                        // No content-length and not chunked; read until EOF
-                        // (caller's socket timeout will eventually fire)
-                    }
-                }
+    /** Returns the index of the first \r\n\r\n in the buffer, or -1. */
+    private fun indexOfCrlfCrlf(buf: ByteArray): Int {
+        if (buf.size < 4) return -1
+        for (i in 0..(buf.size - 4)) {
+            if (buf[i] == 0x0D.toByte() && buf[i + 1] == 0x0A.toByte() &&
+                buf[i + 2] == 0x0D.toByte() && buf[i + 3] == 0x0A.toByte()
+            ) {
+                return i
             }
-        } catch (_: Exception) {
-            // ignore
         }
-        return body.toByteArray()
+        return -1
     }
 
     private fun handleSocks5(clientSocket: Socket, input: java.io.InputStream) {
